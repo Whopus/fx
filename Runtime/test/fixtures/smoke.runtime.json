@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "id": "curatez-runtime-smoke",
+  "title": "Curatez Runtime Smoke Test",
+  "cells": [
+    {
+      "id": "curatez-agent",
+      "type": "agent",
+      "name": "Curatez Runtime Smoke Test",
+      "reasoning": "low",
+      "toolExecution": "parallel",
+      "cells": [
+        {
+          "id": "system-smoke",
+          "type": "system",
+          "content": "Follow the user's output format exactly."
+        },
+        {
+          "id": "query-smoke",
+          "type": "query",
+          "content": [
+            {
+              "type": "text",
+              "text": "Reply with exactly CURATEZ_RUNTIME_OK and nothing else."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

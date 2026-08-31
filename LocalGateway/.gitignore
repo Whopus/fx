@@ -1,0 +1,6 @@
+.env
+colima/
+config/
+docker-config/
+lima/
+toolchain/

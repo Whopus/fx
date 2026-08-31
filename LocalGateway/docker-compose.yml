@@ -1,0 +1,76 @@
+services:
+  sub2api:
+    image: weishaw/sub2api:latest
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - sub2api_data:/app/data
+    environment:
+      AUTO_SETUP: "true"
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8080
+      SERVER_MODE: release
+      RUN_MODE: standard
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_USER: sub2api
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      DATABASE_DBNAME: sub2api
+      DATABASE_SSLMODE: disable
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      ADMIN_EMAIL: ${ADMIN_EMAIL:?required}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?required}
+      JWT_SECRET: ${JWT_SECRET:?required}
+      TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY:?required}
+      HTTP_PROXY: http://host.docker.internal:15236
+      HTTPS_PROXY: http://host.docker.internal:15236
+      NO_PROXY: localhost,127.0.0.1,postgres,redis
+      TZ: Asia/Shanghai
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "5", "-O", "/dev/null", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_USER: sub2api
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      POSTGRES_DB: sub2api
+      TZ: Asia/Shanghai
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sub2api -d sub2api"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  sub2api_data:
+  postgres_data:
+  redis_data:
