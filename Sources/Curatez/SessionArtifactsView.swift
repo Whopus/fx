@@ -20,16 +20,23 @@ struct SessionArtifactVisibleRow: Identifiable, Hashable {
 final class SessionArtifactTreeModel: ObservableObject {
     @Published private(set) var rootURL: URL?
     @Published private(set) var excludedTopLevelPaths: Set<String> = []
+    @Published private(set) var excludesManagedItemDirectories = false
     @Published private(set) var childrenByDirectory: [URL: [SessionArtifactEntry]] = [:]
     @Published private(set) var loadingDirectories: Set<URL> = []
     @Published var errorMessage: String?
 
-    func configure(rootURL: URL?, excludedTopLevelPaths: Set<String>) async {
+    func configure(
+        rootURL: URL?,
+        excludedTopLevelPaths: Set<String>,
+        excludesManagedItemDirectories: Bool
+    ) async {
         let normalized = rootURL?.standardizedFileURL
         let normalizedExclusions = Set(excludedTopLevelPaths.map {
             URL(fileURLWithPath: $0).standardizedFileURL.path
         })
-        guard self.rootURL != normalized || self.excludedTopLevelPaths != normalizedExclusions else {
+        guard self.rootURL != normalized
+                || self.excludedTopLevelPaths != normalizedExclusions
+                || self.excludesManagedItemDirectories != excludesManagedItemDirectories else {
             if let normalized, childrenByDirectory[normalized] == nil {
                 await loadDirectory(normalized)
             }
@@ -39,6 +46,7 @@ final class SessionArtifactTreeModel: ObservableObject {
         let rootChanged = self.rootURL != normalized
         self.rootURL = normalized
         self.excludedTopLevelPaths = normalizedExclusions
+        self.excludesManagedItemDirectories = excludesManagedItemDirectories
         if rootChanged {
             childrenByDirectory.removeAll(keepingCapacity: true)
             loadingDirectories.removeAll(keepingCapacity: true)
@@ -58,10 +66,12 @@ final class SessionArtifactTreeModel: ObservableObject {
 
         do {
             let excludedPaths = directoryURL == rootURL ? excludedTopLevelPaths : []
+            let excludesManagedDirectories = directoryURL == rootURL && excludesManagedItemDirectories
             let entries = try await Task.detached(priority: .utility) {
                 try Self.scanDirectory(
                     directoryURL,
-                    excluding: excludedPaths
+                    excluding: excludedPaths,
+                    excludingManagedItemDirectories: excludesManagedDirectories
                 )
             }.value
             guard directoryURL == rootURL || childrenByDirectory.keys.contains(where: {
@@ -77,12 +87,14 @@ final class SessionArtifactTreeModel: ObservableObject {
         guard let rootURL else { return }
         let loadedDirectories = Set(childrenByDirectory.keys).union([rootURL])
         let excludedTopLevelPaths = self.excludedTopLevelPaths
+        let excludesManagedItemDirectories = self.excludesManagedItemDirectories
         let refreshed = await Task.detached(priority: .utility) {
             var result: [URL: [SessionArtifactEntry]] = [:]
             for directoryURL in loadedDirectories {
                 if let entries = try? Self.scanDirectory(
                     directoryURL,
-                    excluding: directoryURL == rootURL ? excludedTopLevelPaths : []
+                    excluding: directoryURL == rootURL ? excludedTopLevelPaths : [],
+                    excludingManagedItemDirectories: directoryURL == rootURL && excludesManagedItemDirectories
                 ) {
                     result[directoryURL] = entries
                 }
@@ -127,7 +139,8 @@ final class SessionArtifactTreeModel: ObservableObject {
 
     nonisolated static func scanDirectory(
         _ directoryURL: URL,
-        excluding excludedPaths: Set<String> = []
+        excluding excludedPaths: Set<String> = [],
+        excludingManagedItemDirectories: Bool = false
     ) throws -> [SessionArtifactEntry] {
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
         let urls = try FileManager.default.contentsOfDirectory(
@@ -136,13 +149,21 @@ final class SessionArtifactTreeModel: ObservableObject {
             options: [.skipsHiddenFiles]
         )
 
-        return try urls.filter {
-            !excludedPaths.contains($0.standardizedFileURL.path)
-        }.map { url in
+        return try urls.compactMap { url in
+            let normalizedURL = url.standardizedFileURL
+            guard !excludedPaths.contains(normalizedURL.path) else { return nil }
             let values = try url.resourceValues(forKeys: keys)
+            let isDirectory = values.isDirectory == true && values.isSymbolicLink != true
+            if excludingManagedItemDirectories,
+               isDirectory,
+               FileManager.default.fileExists(
+                   atPath: normalizedURL.appendingPathComponent("metadata.json").path
+               ) {
+                return nil
+            }
             return SessionArtifactEntry(
-                url: url.standardizedFileURL,
-                isDirectory: values.isDirectory == true && values.isSymbolicLink != true
+                url: normalizedURL,
+                isDirectory: isDirectory
             )
         }
         .sorted {
@@ -155,6 +176,7 @@ final class SessionArtifactTreeModel: ObservableObject {
 struct ContextSessionArtifactsView: View {
     let rootURL: URL?
     let excludedTopLevelPaths: Set<String>
+    let excludesManagedItemDirectories: Bool
     let refreshRevision: Int
 
     @StateObject private var model = SessionArtifactTreeModel()
@@ -231,7 +253,8 @@ struct ContextSessionArtifactsView: View {
             selectedPath = nil
             await model.configure(
                 rootURL: rootURL,
-                excludedTopLevelPaths: excludedTopLevelPaths
+                excludedTopLevelPaths: excludedTopLevelPaths,
+                excludesManagedItemDirectories: excludesManagedItemDirectories
             )
         }
         .onChange(of: refreshRevision) { _, _ in
@@ -248,7 +271,10 @@ struct ContextSessionArtifactsView: View {
     }
 
     private var configurationIdentity: String {
-        ([rootURL?.standardizedFileURL.path ?? ""] + excludedTopLevelPaths.sorted())
+        ([
+            rootURL?.standardizedFileURL.path ?? "",
+            excludesManagedItemDirectories ? "managed" : "unmanaged"
+        ] + excludedTopLevelPaths.sorted())
             .joined(separator: "\u{0}")
     }
 

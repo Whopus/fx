@@ -571,6 +571,12 @@ struct CollectionEditorView: View {
         })
     }
 
+    private var artifactsUsesManagedLibraryRoot: Bool {
+        guard let collection = store.selectedCollection else { return false }
+        return runtimeWorkingDirectoryURL?.standardizedFileURL
+            == store.folderURL(for: collection).standardizedFileURL
+    }
+
     var body: some View {
         GeometryReader { geometry in
             let sidebarWidth = min(260, max(230, geometry.size.width * 0.27))
@@ -661,6 +667,7 @@ struct CollectionEditorView: View {
             ContextSessionArtifactsView(
                 rootURL: runtimeWorkingDirectoryURL,
                 excludedTopLevelPaths: managedLibraryItemPaths,
+                excludesManagedItemDirectories: artifactsUsesManagedLibraryRoot,
                 refreshRevision: artifactRefreshRevision
             )
             .frame(minHeight: 190, idealHeight: 280, maxHeight: 340)

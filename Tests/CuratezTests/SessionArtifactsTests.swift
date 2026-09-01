@@ -13,6 +13,10 @@ final class SessionArtifactsTests: XCTestCase {
         try fileManager.createDirectory(at: root.appendingPathComponent("Folder 10"), withIntermediateDirectories: true)
         XCTAssertTrue(fileManager.createFile(atPath: root.appendingPathComponent("artifact.txt").path, contents: Data()))
         XCTAssertTrue(fileManager.createFile(atPath: root.appendingPathComponent(".hidden").path, contents: Data()))
+        XCTAssertTrue(fileManager.createFile(
+            atPath: root.appendingPathComponent("Folder 10/metadata.json").path,
+            contents: Data("{}".utf8)
+        ))
 
         let entries = try SessionArtifactTreeModel.scanDirectory(root)
 
@@ -24,5 +28,11 @@ final class SessionArtifactsTests: XCTestCase {
             excluding: [root.appendingPathComponent("Folder 2").standardizedFileURL.path]
         )
         XCTAssertEqual(filtered.map(\.name), ["Folder 10", "artifact.txt"])
+
+        let withoutManagedItems = try SessionArtifactTreeModel.scanDirectory(
+            root,
+            excludingManagedItemDirectories: true
+        )
+        XCTAssertEqual(withoutManagedItems.map(\.name), ["Folder 2", "artifact.txt"])
     }
 }
