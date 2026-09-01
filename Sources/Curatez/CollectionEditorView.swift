@@ -565,6 +565,12 @@ struct CollectionEditorView: View {
         return availableRecords.filter { ($0.space ?? .context) == space }
     }
 
+    private var managedLibraryItemPaths: Set<String> {
+        Set(availableRecords.compactMap { record in
+            store.containerURL(for: record)?.standardizedFileURL.path
+        })
+    }
+
     var body: some View {
         GeometryReader { geometry in
             let sidebarWidth = min(260, max(230, geometry.size.width * 0.27))
@@ -654,6 +660,7 @@ struct CollectionEditorView: View {
 
             ContextSessionArtifactsView(
                 rootURL: runtimeWorkingDirectoryURL,
+                excludedTopLevelPaths: managedLibraryItemPaths,
                 refreshRevision: artifactRefreshRevision
             )
             .frame(minHeight: 190, idealHeight: 280, maxHeight: 340)

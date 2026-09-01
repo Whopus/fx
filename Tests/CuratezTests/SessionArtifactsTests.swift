@@ -18,5 +18,11 @@ final class SessionArtifactsTests: XCTestCase {
 
         XCTAssertEqual(entries.map(\.name), ["Folder 2", "Folder 10", "artifact.txt"])
         XCTAssertEqual(entries.map(\.isDirectory), [true, true, false])
+
+        let filtered = try SessionArtifactTreeModel.scanDirectory(
+            root,
+            excluding: [root.appendingPathComponent("Folder 2").standardizedFileURL.path]
+        )
+        XCTAssertEqual(filtered.map(\.name), ["Folder 10", "artifact.txt"])
     }
 }

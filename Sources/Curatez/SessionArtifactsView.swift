@@ -19,25 +19,33 @@ struct SessionArtifactVisibleRow: Identifiable, Hashable {
 @MainActor
 final class SessionArtifactTreeModel: ObservableObject {
     @Published private(set) var rootURL: URL?
+    @Published private(set) var excludedTopLevelPaths: Set<String> = []
     @Published private(set) var childrenByDirectory: [URL: [SessionArtifactEntry]] = [:]
     @Published private(set) var loadingDirectories: Set<URL> = []
     @Published var errorMessage: String?
 
-    func configure(rootURL: URL?) async {
+    func configure(rootURL: URL?, excludedTopLevelPaths: Set<String>) async {
         let normalized = rootURL?.standardizedFileURL
-        guard self.rootURL != normalized else {
+        let normalizedExclusions = Set(excludedTopLevelPaths.map {
+            URL(fileURLWithPath: $0).standardizedFileURL.path
+        })
+        guard self.rootURL != normalized || self.excludedTopLevelPaths != normalizedExclusions else {
             if let normalized, childrenByDirectory[normalized] == nil {
                 await loadDirectory(normalized)
             }
             return
         }
 
+        let rootChanged = self.rootURL != normalized
         self.rootURL = normalized
-        childrenByDirectory.removeAll(keepingCapacity: true)
-        loadingDirectories.removeAll(keepingCapacity: true)
+        self.excludedTopLevelPaths = normalizedExclusions
+        if rootChanged {
+            childrenByDirectory.removeAll(keepingCapacity: true)
+            loadingDirectories.removeAll(keepingCapacity: true)
+        }
         errorMessage = nil
         if let normalized {
-            await loadDirectory(normalized)
+            await loadDirectory(normalized, force: true)
         }
     }
 
@@ -49,8 +57,12 @@ final class SessionArtifactTreeModel: ObservableObject {
         defer { loadingDirectories.remove(directoryURL) }
 
         do {
+            let excludedPaths = directoryURL == rootURL ? excludedTopLevelPaths : []
             let entries = try await Task.detached(priority: .utility) {
-                try Self.scanDirectory(directoryURL)
+                try Self.scanDirectory(
+                    directoryURL,
+                    excluding: excludedPaths
+                )
             }.value
             guard directoryURL == rootURL || childrenByDirectory.keys.contains(where: {
                 directoryURL.path.hasPrefix($0.path + "/")
@@ -64,10 +76,14 @@ final class SessionArtifactTreeModel: ObservableObject {
     func refreshLoadedDirectories() async {
         guard let rootURL else { return }
         let loadedDirectories = Set(childrenByDirectory.keys).union([rootURL])
+        let excludedTopLevelPaths = self.excludedTopLevelPaths
         let refreshed = await Task.detached(priority: .utility) {
             var result: [URL: [SessionArtifactEntry]] = [:]
             for directoryURL in loadedDirectories {
-                if let entries = try? Self.scanDirectory(directoryURL) {
+                if let entries = try? Self.scanDirectory(
+                    directoryURL,
+                    excluding: directoryURL == rootURL ? excludedTopLevelPaths : []
+                ) {
                     result[directoryURL] = entries
                 }
             }
@@ -109,7 +125,10 @@ final class SessionArtifactTreeModel: ObservableObject {
         }
     }
 
-    nonisolated static func scanDirectory(_ directoryURL: URL) throws -> [SessionArtifactEntry] {
+    nonisolated static func scanDirectory(
+        _ directoryURL: URL,
+        excluding excludedPaths: Set<String> = []
+    ) throws -> [SessionArtifactEntry] {
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
         let urls = try FileManager.default.contentsOfDirectory(
             at: directoryURL,
@@ -117,7 +136,9 @@ final class SessionArtifactTreeModel: ObservableObject {
             options: [.skipsHiddenFiles]
         )
 
-        return try urls.map { url in
+        return try urls.filter {
+            !excludedPaths.contains($0.standardizedFileURL.path)
+        }.map { url in
             let values = try url.resourceValues(forKeys: keys)
             return SessionArtifactEntry(
                 url: url.standardizedFileURL,
@@ -133,6 +154,7 @@ final class SessionArtifactTreeModel: ObservableObject {
 
 struct ContextSessionArtifactsView: View {
     let rootURL: URL?
+    let excludedTopLevelPaths: Set<String>
     let refreshRevision: Int
 
     @StateObject private var model = SessionArtifactTreeModel()
@@ -204,10 +226,13 @@ struct ContextSessionArtifactsView: View {
                     .padding(.top, 9)
             }
         }
-        .task(id: rootURL?.standardizedFileURL.path) {
+        .task(id: configurationIdentity) {
             expandedPaths.removeAll(keepingCapacity: true)
             selectedPath = nil
-            await model.configure(rootURL: rootURL)
+            await model.configure(
+                rootURL: rootURL,
+                excludedTopLevelPaths: excludedTopLevelPaths
+            )
         }
         .onChange(of: refreshRevision) { _, _ in
             Task { await model.refreshLoadedDirectories() }
@@ -220,6 +245,11 @@ struct ContextSessionArtifactsView: View {
         } message: {
             Text(model.errorMessage ?? "文件操作失败。")
         }
+    }
+
+    private var configurationIdentity: String {
+        ([rootURL?.standardizedFileURL.path ?? ""] + excludedTopLevelPaths.sorted())
+            .joined(separator: "\u{0}")
     }
 
     private func artifactRow(_ row: SessionArtifactVisibleRow) -> some View {
