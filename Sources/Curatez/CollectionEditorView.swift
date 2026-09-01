@@ -2,14 +2,6 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-private struct ContextItemPositionKey: PreferenceKey {
-    static let defaultValue: [UUID: CGFloat] = [:]
-
-    static func reduce(value: inout [UUID: CGFloat], nextValue: () -> [UUID: CGFloat]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, next in next })
-    }
-}
-
 private enum ContextEditorFocus: Hashable {
     case title(UUID)
     case body(UUID)
@@ -56,9 +48,172 @@ private final class ContextScrollAnimationDriver: NSObject {
 }
 
 @MainActor
-private final class ContextEditorScrollCache {
-    weak var scrollView: NSScrollView?
-    var itemPositions: [UUID: CGFloat] = [:]
+private final class ContextEditorScrollCache: NSObject {
+    private final class WeakAnchor {
+        weak var view: NSView?
+
+        init(_ view: NSView) {
+            self.view = view
+        }
+    }
+
+    private weak var scrollView: NSScrollView?
+    private var anchors: [UUID: WeakAnchor] = [:]
+    private var scheduledSelectionRefresh = false
+    private var lastReportedItemID: UUID?
+    var onActiveItemChange: ((UUID) -> Void)?
+    var resolvedScrollView: NSScrollView? { scrollView }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    func install(scrollView: NSScrollView) {
+        guard self.scrollView !== scrollView else {
+            scheduleSelectionRefresh()
+            return
+        }
+
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSView.boundsDidChangeNotification,
+            object: self.scrollView?.contentView
+        )
+        self.scrollView = scrollView
+        scrollView.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(clipViewBoundsDidChange(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView
+        )
+        scheduleSelectionRefresh()
+    }
+
+    func register(_ anchor: NSView, for itemID: UUID) {
+        guard anchors[itemID]?.view !== anchor else { return }
+        anchors[itemID] = WeakAnchor(anchor)
+        scheduleSelectionRefresh()
+    }
+
+    func unregister(_ anchor: NSView, for itemID: UUID) {
+        guard anchors[itemID]?.view === anchor else { return }
+        anchors[itemID] = nil
+        if lastReportedItemID == itemID {
+            lastReportedItemID = nil
+        }
+    }
+
+    func relativePosition(for itemID: UUID) -> CGFloat? {
+        guard let scrollView,
+              let anchor = anchors[itemID]?.view,
+              anchor.window != nil else { return nil }
+        return relativeTop(of: anchor, in: scrollView.contentView)
+    }
+
+    @objc private func clipViewBoundsDidChange(_ notification: Notification) {
+        refreshActiveItem()
+    }
+
+    private func scheduleSelectionRefresh() {
+        guard !scheduledSelectionRefresh else { return }
+        scheduledSelectionRefresh = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.scheduledSelectionRefresh = false
+            self.refreshActiveItem()
+        }
+    }
+
+    private func refreshActiveItem() {
+        guard let scrollView else { return }
+        let clipView = scrollView.contentView
+        anchors = anchors.filter { $0.value.view != nil }
+        let positions = anchors.compactMap { itemID, anchor -> (UUID, CGFloat)? in
+            guard let view = anchor.view, view.window != nil else { return nil }
+            return (itemID, relativeTop(of: view, in: clipView))
+        }
+        guard let activeItemID = Self.activeItemID(in: positions),
+              activeItemID != lastReportedItemID else { return }
+        lastReportedItemID = activeItemID
+        onActiveItemChange?(activeItemID)
+    }
+
+    private func relativeTop(of anchor: NSView, in clipView: NSClipView) -> CGFloat {
+        let rect = anchor.convert(anchor.bounds, to: clipView)
+        if clipView.isFlipped {
+            return rect.minY - clipView.bounds.minY
+        }
+        return clipView.bounds.maxY - rect.maxY
+    }
+
+    private static func activeItemID(in positions: [(UUID, CGFloat)]) -> UUID? {
+        guard !positions.isEmpty else { return nil }
+        let activationLine: CGFloat = 54
+        if let passed = positions
+            .filter({ $0.1 <= activationLine })
+            .max(by: { $0.1 < $1.1 }) {
+            return passed.0
+        }
+        return positions.min(by: {
+            abs($0.1 - activationLine) < abs($1.1 - activationLine)
+        })?.0
+    }
+}
+
+@MainActor
+private final class ContextMarkdownPreviewCache {
+    struct Value {
+        let source: String
+        let normalized: String
+        let collapsed: String
+        let totalLines: Int
+        let lineLimit: Int
+    }
+
+    private var values: [UUID: Value] = [:]
+
+    func preview(
+        for source: String,
+        itemID: UUID,
+        lineLimit: Int,
+        isExpanded: Bool
+    ) -> (markdown: String, totalLines: Int, canToggle: Bool, isExpanded: Bool) {
+        let value: Value
+        if let cached = values[itemID],
+           cached.lineLimit == lineLimit,
+           cached.source == source {
+            value = cached
+        } else {
+            let normalized = source
+                .replacingOccurrences(of: "\r\n", with: "\n")
+                .replacingOccurrences(of: "\r", with: "\n")
+                .trimmingCharacters(in: .newlines)
+            let lines = normalized.isEmpty
+                ? []
+                : normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            value = Value(
+                source: source,
+                normalized: normalized,
+                collapsed: lines.prefix(lineLimit).joined(separator: "\n"),
+                totalLines: lines.count,
+                lineLimit: lineLimit
+            )
+            values[itemID] = value
+        }
+
+        let canToggle = value.totalLines > lineLimit
+        return (
+            isExpanded || !canToggle ? value.normalized : value.collapsed,
+            value.totalLines,
+            canToggle,
+            isExpanded
+        )
+    }
+
+    func removeValue(for itemID: UUID) {
+        values[itemID] = nil
+    }
 }
 
 @MainActor
@@ -298,12 +453,12 @@ private final class ContextLiveActivityStore: ObservableObject {
 
         // Token deltas can arrive hundreds of times per second. Publishing each one
         // invalidates the Markdown and tool hierarchy, so coalesce them to a smooth
-        // 20 fps while flushing structural/end events immediately.
+        // 8 fps while flushing structural/end events immediately.
         if Self.requiresImmediateFlush(event.type) {
             flush()
         } else if scheduledFlush == nil {
             scheduledFlush = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(50))
+                try? await Task.sleep(for: .milliseconds(125))
                 guard !Task.isCancelled else { return }
                 self?.flush()
             }
@@ -391,6 +546,10 @@ struct CollectionEditorView: View {
     @State private var modelPickerInteractionEpoch = 0
     @State private var modelPickerClickMonitor = ContextModelPickerClickMonitor()
     @State private var expandedMarkdownItemIDs: Set<UUID> = []
+    @State private var markdownPreviewCache = ContextMarkdownPreviewCache()
+    @State private var availableRecordsSnapshot: [CaptureRecord] = []
+    @State private var availableRecordsByID: [UUID: CaptureRecord] = [:]
+    @State private var artifactRefreshRevision = 0
     @FocusState private var focusedEditorField: ContextEditorFocus?
 
     private var runtimeWorkingDirectoryURL: URL? {
@@ -398,7 +557,7 @@ struct CollectionEditorView: View {
     }
 
     private var availableRecords: [CaptureRecord] {
-        store.records.filter { !$0.isTrashed }
+        availableRecordsSnapshot
     }
 
     private var libraryRecords: [CaptureRecord] {
@@ -418,6 +577,11 @@ struct CollectionEditorView: View {
         .background(Color.white)
         .ignoresSafeArea()
         .onAppear(perform: loadNotebook)
+        .onReceive(store.$records) { records in
+            let available = records.filter { !$0.isTrashed }
+            availableRecordsSnapshot = available
+            availableRecordsByID = Dictionary(uniqueKeysWithValues: available.map { ($0.id, $0) })
+        }
         .onExitCommand {
             if isModelPickerPresented {
                 dismissModelPicker()
@@ -436,7 +600,7 @@ struct CollectionEditorView: View {
                 itemType: libraryItemKind.captureSpace ?? .context,
                 records: libraryRecords,
                 isReplacing: libraryReplacementItemID != nil,
-                onSelect: addRecord
+                onSelect: addRecords
             )
         }
         .alert("Context Editor", isPresented: Binding(
@@ -487,6 +651,13 @@ struct CollectionEditorView: View {
             }
             .scrollIndicators(.hidden)
             .padding(.top, 7)
+
+            ContextSessionArtifactsView(
+                rootURL: runtimeWorkingDirectoryURL,
+                refreshRevision: artifactRefreshRevision
+            )
+            .frame(minHeight: 190, idealHeight: 280, maxHeight: 340)
+            .padding(.top, 12)
         }
         .padding(.leading, 28)
         .padding(.trailing, 28)
@@ -689,6 +860,7 @@ struct CollectionEditorView: View {
     @ViewBuilder
     private var editorContent: some View {
         if !notebook.items.isEmpty {
+            let outputRoundsByID = ContextOutputPresentation.roundsByItem(in: notebook.items)
             GeometryReader { editorGeometry in
                 ScrollViewReader { proxy in
                     VStack(spacing: 0) {
@@ -701,15 +873,17 @@ struct CollectionEditorView: View {
                             VStack(alignment: .leading, spacing: 0) {
                                 ForEach($notebook.items) { item in
                                     let itemID = item.wrappedValue.id
-                                    documentSection(item)
+                                    documentSection(
+                                        item,
+                                        availableRecordsByID: availableRecordsByID,
+                                        outputRoundsByID: outputRoundsByID
+                                    )
                                         .id(itemID)
                                         .background {
-                                            GeometryReader { geometry in
-                                                Color.clear.preference(
-                                                    key: ContextItemPositionKey.self,
-                                                    value: [itemID: geometry.frame(in: .named("context-document")).minY]
-                                                )
-                                            }
+                                            ContextItemScrollAnchor(
+                                                itemID: itemID,
+                                                cache: documentScrollCache
+                                            )
                                         }
                                 }
 
@@ -719,20 +893,14 @@ struct CollectionEditorView: View {
                             .padding(.top, 12)
                             .padding(.trailing, 30)
                         }
-                        .background {
-                            ContextScrollViewResolver { scrollView in
-                                documentScrollCache.scrollView = scrollView
+                        .onAppear {
+                            documentScrollCache.onActiveItemChange = { itemID in
+                                guard navigationLockID == nil,
+                                      itemID != selectedItemID else { return }
+                                selectedItemID = itemID
                             }
                         }
-                        .coordinateSpace(name: "context-document")
                         .scrollIndicators(.hidden)
-                        .onPreferenceChange(ContextItemPositionKey.self) { positions in
-                            documentScrollCache.itemPositions = positions
-                            guard navigationLockID == nil,
-                                  let activeID = activeItemID(in: positions),
-                                  activeID != selectedItemID else { return }
-                            selectedItemID = activeID
-                        }
                         .onChange(of: navigationTargetID) { _, id in
                             guard let id else { return }
                             NSApp.keyWindow?.makeFirstResponder(nil)
@@ -1136,13 +1304,21 @@ struct CollectionEditorView: View {
         }
     }
 
-    private func documentSection(_ item: Binding<ContextNotebookItem>) -> some View {
+    private func documentSection(
+        _ item: Binding<ContextNotebookItem>,
+        availableRecordsByID: [UUID: CaptureRecord],
+        outputRoundsByID: [UUID: [ContextRunRound]]
+    ) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(item.wrappedValue.kind.menuLabel)
                 .font(.system(size: 14))
                 .foregroundStyle(.secondary.opacity(0.64))
 
-            selectedItemEditor(item)
+            selectedItemEditor(
+                item,
+                availableRecordsByID: availableRecordsByID,
+                outputRoundsByID: outputRoundsByID
+            )
 
             Rectangle()
                 .fill(.black.opacity(0.055))
@@ -1153,11 +1329,15 @@ struct CollectionEditorView: View {
     }
 
     @ViewBuilder
-    private func selectedItemEditor(_ item: Binding<ContextNotebookItem>) -> some View {
+    private func selectedItemEditor(
+        _ item: Binding<ContextNotebookItem>,
+        availableRecordsByID: [UUID: CaptureRecord],
+        outputRoundsByID: [UUID: [ContextRunRound]]
+    ) -> some View {
         let value = item.wrappedValue
         if value.kind == .context,
            let id = value.sourceRecordID,
-           let record = availableRecords.first(where: { $0.id == id }) {
+           let record = availableRecordsByID[id] {
             referencedRecordEditor(item, record: record)
         } else {
             switch value.kind {
@@ -1187,7 +1367,7 @@ struct CollectionEditorView: View {
                     bodyPrompt: "Subagent system instructions…"
                 )
             case .output:
-                outputEditor(value)
+                outputEditor(value, visibleRounds: outputRoundsByID[value.id] ?? [])
             case .placeholder:
                 placeholderEditor(item)
             }
@@ -1475,20 +1655,12 @@ struct CollectionEditorView: View {
         itemID: UUID,
         lineLimit: Int = 10
     ) -> (markdown: String, totalLines: Int, canToggle: Bool, isExpanded: Bool) {
-        let normalized = markdown
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-            .trimmingCharacters(in: .newlines)
-        let lines = normalized.isEmpty
-            ? []
-            : normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         let isExpanded = expandedMarkdownItemIDs.contains(itemID)
-        let canToggle = lines.count > lineLimit
-        return (
-            isExpanded || !canToggle ? normalized : lines.prefix(lineLimit).joined(separator: "\n"),
-            lines.count,
-            canToggle,
-            isExpanded
+        return markdownPreviewCache.preview(
+            for: markdown,
+            itemID: itemID,
+            lineLimit: lineLimit,
+            isExpanded: isExpanded
         )
     }
 
@@ -1602,8 +1774,10 @@ struct CollectionEditorView: View {
         .overlay { Rectangle().stroke(.black.opacity(0.055), lineWidth: 1) }
     }
 
-    private func outputEditor(_ item: ContextNotebookItem) -> some View {
-        let visibleRounds = ContextOutputPresentation.rounds(for: item, in: notebook.items)
+    private func outputEditor(
+        _ item: ContextNotebookItem,
+        visibleRounds: [ContextRunRound]
+    ) -> some View {
         let hasVisibleActivity = visibleRounds.contains(where: { !($0.steps ?? []).isEmpty })
         return VStack(alignment: .leading, spacing: 0) {
             Text("Agent output")
@@ -1681,7 +1855,10 @@ struct CollectionEditorView: View {
         navigationTargetID = item.id
     }
 
-    private func addRecord(_ record: CaptureRecord) {
+    private func notebookItem(
+        for record: CaptureRecord,
+        id: UUID = UUID()
+    ) -> ContextNotebookItem {
         let space = record.space ?? .context
         let kind: ContextCellKind = switch space {
         case .system: .system
@@ -1693,9 +1870,8 @@ struct CollectionEditorView: View {
         case .session: .context
         }
         let configuration = record.agentConfiguration
-        let replacementID = libraryReplacementItemID
-        let item = ContextNotebookItem(
-            id: replacementID ?? UUID(),
+        return ContextNotebookItem(
+            id: id,
             kind: kind,
             title: kind == .query ? "" : record.title,
             body: kind == .context ? store.context(for: record) : store.originalTextContent(for: record) ?? record.text ?? "",
@@ -1706,14 +1882,18 @@ struct CollectionEditorView: View {
             model: configuration?.model,
             fork: configuration?.fork
         )
+    }
 
-        if let replacementID {
+    private func addRecords(_ records: [CaptureRecord]) {
+        guard !records.isEmpty else { return }
+
+        if let replacementID = libraryReplacementItemID {
             guard let index = notebook.items.firstIndex(where: { $0.id == replacementID }) else {
                 finishLibrarySelection()
                 return
             }
             NSApp.keyWindow?.makeFirstResponder(nil)
-            notebook.items[index] = item
+            notebook.items[index] = notebookItem(for: records[0], id: replacementID)
             libraryReplacementItemID = nil
             libraryInsertionIndex = nil
             navigationLockID = replacementID
@@ -1723,11 +1903,13 @@ struct CollectionEditorView: View {
         }
 
         let index = min(max(0, libraryInsertionIndex ?? notebook.items.count), notebook.items.count)
-        notebook.items.insert(item, at: index)
+        let newItems = records.map { notebookItem(for: $0) }
+        notebook.items.insert(contentsOf: newItems, at: index)
         libraryInsertionIndex = nil
-        navigationLockID = item.id
-        selectedItemID = item.id
-        navigationTargetID = item.id
+        guard let firstItem = newItems.first else { return }
+        navigationLockID = firstItem.id
+        selectedItemID = firstItem.id
+        navigationTargetID = firstItem.id
     }
 
     private func replaceItem(_ id: UUID, with kind: ContextCellKind) {
@@ -1771,6 +1953,8 @@ struct CollectionEditorView: View {
         if navigationLockID == id { navigationLockID = nil }
         if hoveredItemID == id { hoveredItemID = nil }
         if draggedItemID == id { draggedItemID = nil }
+        expandedMarkdownItemIDs.remove(id)
+        markdownPreviewCache.removeValue(for: id)
         selectedItemID = replacementID
         notebook.items.remove(at: index)
     }
@@ -1832,14 +2016,15 @@ struct CollectionEditorView: View {
             errorMessage = error.localizedDescription
             return
         }
-        let contexts = Dictionary(uniqueKeysWithValues: availableRecords.map { ($0.id, store.context(for: $0)) })
-        let mediaURLs = Dictionary(uniqueKeysWithValues: availableRecords.compactMap { record in
+        let records = availableRecords
+        let contexts = Dictionary(uniqueKeysWithValues: records.map { ($0.id, store.context(for: $0)) })
+        let mediaURLs = Dictionary(uniqueKeysWithValues: records.compactMap { record in
             store.contextMediaURL(for: record).map { (record.id, $0) }
         })
         let payload = ContextRuntimePayload(
             notebook: notebook,
             collectionURL: runtimeWorkingDirectoryURL,
-            records: availableRecords,
+            records: records,
             contexts: contexts,
             mediaURLs: mediaURLs
         )
@@ -1871,7 +2056,10 @@ struct CollectionEditorView: View {
         isRunning = true
 
         Task { @MainActor in
-            defer { isRunning = false }
+            defer {
+                isRunning = false
+                artifactRefreshRevision &+= 1
+            }
             do {
                 let result = try await ContextPiRunner.run(payload) { event in
                     guard liveOutputID == outputID else { return }
@@ -1927,23 +2115,12 @@ struct CollectionEditorView: View {
         return item.kind.defaultTitle
     }
 
-    private func activeItemID(in positions: [UUID: CGFloat]) -> UUID? {
-        guard !positions.isEmpty else { return nil }
-        let activationLine: CGFloat = 54
-        if let passed = positions
-            .filter({ $0.value <= activationLine })
-            .max(by: { $0.value < $1.value }) {
-            return passed.key
-        }
-        return positions.min(by: { abs($0.value - activationLine) < abs($1.value - activationLine) })?.key
-    }
-
     /// Scrolls the document with the exact quadratic Bézier position equation:
     /// B(t) = (1-t)^2 * from + 2(1-t)t * control + t^2 * to.
     @discardableResult
     private func animateDocumentScroll(to itemID: UUID) -> Bool {
-        guard let scrollView = documentScrollCache.scrollView,
-              let relativeTargetY = documentScrollCache.itemPositions[itemID],
+        guard let scrollView = documentScrollCache.resolvedScrollView,
+              let relativeTargetY = documentScrollCache.relativePosition(for: itemID),
               let documentView = scrollView.documentView else { return false }
 
         let clipView = scrollView.contentView
@@ -2034,8 +2211,9 @@ private struct ContextLibraryPicker: View {
     let itemType: CaptureSpace
     let records: [CaptureRecord]
     let isReplacing: Bool
-    let onSelect: (CaptureRecord) -> Void
+    let onSelect: ([CaptureRecord]) -> Void
     @State private var search = ""
+    @State private var selectedRecordIDs: Set<UUID> = []
 
     private var filtered: [CaptureRecord] {
         let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2054,11 +2232,22 @@ private struct ContextLibraryPicker: View {
                     Text("选择 \(itemType.displayName) Item").font(.system(size: 20, weight: .semibold))
                     Text(isReplacing
                         ? "从 Library 中选择一个 \(itemType.displayName)，替换当前 Item。"
-                        : "从 Library 中选择一个 \(itemType.displayName)，插入到当前位置。")
+                        : "可多选；确认后按列表顺序插入到当前位置。")
                         .font(.system(size: 12)).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("完成") { dismiss() }.buttonStyle(.borderedProminent).tint(.black)
+                Button("取消") { dismiss() }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                if !isReplacing {
+                    Button(selectedRecordIDs.isEmpty ? "添加" : "添加 \(selectedRecordIDs.count) 项") {
+                        onSelect(records.filter { selectedRecordIDs.contains($0.id) })
+                        dismiss()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.black)
+                    .disabled(selectedRecordIDs.isEmpty)
+                }
             }
             .padding(22)
 
@@ -2080,8 +2269,14 @@ private struct ContextLibraryPicker: View {
                         LazyVStack(spacing: 1) {
                             ForEach(filtered) { record in
                                 Button {
-                                    onSelect(record)
-                                    dismiss()
+                                    if isReplacing {
+                                        onSelect([record])
+                                        dismiss()
+                                    } else if selectedRecordIDs.contains(record.id) {
+                                        selectedRecordIDs.remove(record.id)
+                                    } else {
+                                        selectedRecordIDs.insert(record.id)
+                                    }
                                 } label: {
                                     HStack(spacing: 13) {
                                         Group {
@@ -2110,11 +2305,25 @@ private struct ContextLibraryPicker: View {
                                                 .foregroundStyle(.secondary)
                                         }
                                         Spacer()
-                                        Image(systemName: isReplacing ? "arrow.triangle.2.circlepath" : "plus.circle")
-                                            .foregroundStyle(.secondary)
+                                        if isReplacing {
+                                            Image(systemName: "arrow.triangle.2.circlepath")
+                                                .foregroundStyle(.secondary)
+                                        } else {
+                                            Image(systemName: selectedRecordIDs.contains(record.id)
+                                                ? "checkmark.circle.fill"
+                                                : "circle")
+                                                .font(.system(size: 17, weight: .regular))
+                                                .foregroundStyle(selectedRecordIDs.contains(record.id)
+                                                    ? Color.black
+                                                    : Color.secondary.opacity(0.45))
+                                        }
                                     }
                                     .padding(.horizontal, 14)
                                     .frame(height: 62)
+                                    .background(selectedRecordIDs.contains(record.id)
+                                        ? Color.black.opacity(0.045)
+                                        : Color.clear)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
                                     .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
@@ -2127,6 +2336,9 @@ private struct ContextLibraryPicker: View {
         }
         .frame(width: 520, height: 620)
         .background(Color.white)
+        .onAppear {
+            selectedRecordIDs.removeAll(keepingCapacity: true)
+        }
     }
 
     private func coverPreviewURL(for record: CaptureRecord) -> URL? {
@@ -2509,7 +2721,9 @@ private struct ContextLiveRunView: View {
     @ObservedObject var store: ContextLiveActivityStore
 
     var body: some View {
-        LazyVStack(alignment: .leading, spacing: 18) {
+        // Live runs usually contain tens of entries. During token streaming an
+        // eager stack is cheaper than recomputing LazyStack placements every frame.
+        VStack(alignment: .leading, spacing: 18) {
             ForEach(store.activity.entries) { entry in
                 ContextActivityEntryView(entry: entry)
                     .equatable()
@@ -2671,32 +2885,126 @@ private struct ContextActivityMarkdown: View, Equatable {
     }
 }
 
-private struct ContextShimmerText: View {
+private struct ContextShimmerText: NSViewRepresentable {
     let text: String
 
-    var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
-            let elapsed = context.date.timeIntervalSinceReferenceDate
-            let phase = elapsed.truncatingRemainder(dividingBy: 1.55) / 1.55
-            Text(text)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(
-                    LinearGradient(
-                        colors: [
-                            .black.opacity(0.82),
-                            .black.opacity(0.82),
-                            .gray.opacity(0.72),
-                            .white,
-                            .gray.opacity(0.72),
-                            .black.opacity(0.82),
-                            .black.opacity(0.82)
-                        ],
-                        startPoint: UnitPoint(x: phase * 2.4 - 1.4, y: 0.5),
-                        endPoint: UnitPoint(x: phase * 2.4, y: 0.5)
-                    )
-                )
+    func makeNSView(context: Context) -> ContextShimmerLabelView {
+        let view = ContextShimmerLabelView()
+        view.update(text)
+        return view
+    }
+
+    func updateNSView(_ nsView: ContextShimmerLabelView, context: Context) {
+        nsView.update(text)
+    }
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        nsView: ContextShimmerLabelView,
+        context: Context
+    ) -> CGSize? {
+        nsView.intrinsicContentSize
+    }
+}
+
+/// The shimmer runs entirely in Core Animation. SwiftUI only updates this view
+/// when the status string changes; it never participates in animation frames.
+private final class ContextShimmerLabelView: NSView {
+    private static let font = NSFont.systemFont(ofSize: 13, weight: .medium)
+    private let gradient = CAGradientLayer()
+    private let textMask = CATextLayer()
+    private var value = ""
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.addSublayer(gradient)
+
+        gradient.colors = [
+            NSColor.labelColor.withAlphaComponent(0.82).cgColor,
+            NSColor.labelColor.withAlphaComponent(0.82).cgColor,
+            NSColor.secondaryLabelColor.withAlphaComponent(0.72).cgColor,
+            NSColor.white.cgColor,
+            NSColor.secondaryLabelColor.withAlphaComponent(0.72).cgColor,
+            NSColor.labelColor.withAlphaComponent(0.82).cgColor,
+            NSColor.labelColor.withAlphaComponent(0.82).cgColor
+        ]
+        gradient.locations = [0, 0.28, 0.42, 0.5, 0.58, 0.72, 1]
+        gradient.mask = textMask
+
+        textMask.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+        textMask.alignmentMode = .left
+        textMask.truncationMode = .none
+        textMask.isWrapped = false
+        textMask.font = Self.font
+        textMask.fontSize = Self.font.pointSize
+        setAccessibilityElement(true)
+        setAccessibilityRole(.staticText)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func update(_ text: String) {
+        guard value != text else { return }
+        value = text
+        textMask.string = NSAttributedString(
+            string: text,
+            attributes: [
+                .font: Self.font,
+                .foregroundColor: NSColor.white
+            ]
+        )
+        setAccessibilityLabel(text)
+        invalidateIntrinsicContentSize()
+        needsLayout = true
+    }
+
+    override var intrinsicContentSize: NSSize {
+        let size = NSAttributedString(
+            string: value,
+            attributes: [.font: Self.font]
+        ).size()
+        return NSSize(width: ceil(size.width) + 1, height: ceil(size.height) + 2)
+    }
+
+    override func layout() {
+        super.layout()
+        gradient.frame = bounds
+        textMask.frame = bounds
+        startAnimationIfNeeded()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            gradient.removeAnimation(forKey: "curatez-shimmer")
+        } else {
+            startAnimationIfNeeded()
         }
-        .accessibilityLabel(text)
+    }
+
+    private func startAnimationIfNeeded() {
+        guard window != nil,
+              bounds.width > 0,
+              gradient.animation(forKey: "curatez-shimmer") == nil else { return }
+
+        gradient.startPoint = CGPoint(x: 1, y: 0.5)
+        gradient.endPoint = CGPoint(x: 2, y: 0.5)
+        let group = CAAnimationGroup()
+        let start = CABasicAnimation(keyPath: "startPoint")
+        start.fromValue = CGPoint(x: -1, y: 0.5)
+        start.toValue = CGPoint(x: 1, y: 0.5)
+        let end = CABasicAnimation(keyPath: "endPoint")
+        end.fromValue = CGPoint(x: 0, y: 0.5)
+        end.toValue = CGPoint(x: 2, y: 0.5)
+        group.animations = [start, end]
+        group.duration = 1.55
+        group.repeatCount = .infinity
+        group.timingFunction = CAMediaTimingFunction(name: .linear)
+        group.isRemovedOnCompletion = false
+        gradient.add(group, forKey: "curatez-shimmer")
     }
 }
 
@@ -2743,45 +3051,81 @@ private extension JSONValue {
     }
 }
 
-private struct ContextScrollViewResolver: NSViewRepresentable {
-    let onResolve: @MainActor (NSScrollView) -> Void
+/// Registers a section directly with the enclosing AppKit scroll surface.
+/// Unlike a GeometryReader preference, this marker does not publish layout
+/// values through the entire SwiftUI document tree on every scroll frame.
+private struct ContextItemScrollAnchor: NSViewRepresentable {
+    let itemID: UUID
+    let cache: ContextEditorScrollCache
 
-    func makeNSView(context: Context) -> ResolverView {
-        ResolverView(onResolve: onResolve)
+    func makeNSView(context: Context) -> AnchorView {
+        let view = AnchorView()
+        view.configure(itemID: itemID, cache: cache)
+        return view
     }
 
-    func updateNSView(_ nsView: ResolverView, context: Context) {
-        nsView.onResolve = onResolve
-        nsView.resolveEnclosingScrollView()
+    func updateNSView(_ nsView: AnchorView, context: Context) {
+        nsView.configure(itemID: itemID, cache: cache)
     }
 
-    final class ResolverView: NSView {
-        var onResolve: @MainActor (NSScrollView) -> Void
+    static func dismantleNSView(_ nsView: AnchorView, coordinator: Void) {
+        nsView.detach()
+    }
 
-        init(onResolve: @escaping @MainActor (NSScrollView) -> Void) {
-            self.onResolve = onResolve
-            super.init(frame: .zero)
+    final class AnchorView: NSView {
+        private weak var cache: ContextEditorScrollCache?
+        private var itemID: UUID?
+        private var hasScheduledScrollResolution = false
+
+        override var isOpaque: Bool { false }
+
+        func configure(itemID: UUID, cache: ContextEditorScrollCache) {
+            guard self.itemID != itemID || self.cache !== cache else {
+                if cache.resolvedScrollView == nil { resolveScrollView() }
+                return
+            }
+            detach()
+            self.itemID = itemID
+            self.cache = cache
+            cache.register(self, for: itemID)
+            resolveScrollView()
         }
 
-        @available(*, unavailable)
-        required init?(coder: NSCoder) {
-            fatalError("init(coder:) has not been implemented")
+        func detach() {
+            guard let itemID, let cache else { return }
+            cache.unregister(self, for: itemID)
+            self.itemID = nil
+            self.cache = nil
         }
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            resolveEnclosingScrollView()
+            guard window != nil, let itemID, let cache else { return }
+            cache.register(self, for: itemID)
+            resolveScrollView()
         }
 
-        func resolveEnclosingScrollView() {
-            guard let scrollView = enclosingScrollView else {
-                guard window != nil else { return }
-                DispatchQueue.main.async { [weak self] in
-                    self?.resolveEnclosingScrollView()
-                }
+        override func viewDidMoveToSuperview() {
+            super.viewDidMoveToSuperview()
+            resolveScrollView()
+        }
+
+        private func resolveScrollView() {
+            guard let cache else { return }
+            if let scrollView = enclosingScrollView {
+                hasScheduledScrollResolution = false
+                cache.install(scrollView: scrollView)
                 return
             }
-            onResolve(scrollView)
+            guard window != nil, !hasScheduledScrollResolution else { return }
+            hasScheduledScrollResolution = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.hasScheduledScrollResolution = false
+                if let scrollView = self.enclosingScrollView {
+                    self.cache?.install(scrollView: scrollView)
+                }
+            }
         }
     }
 }

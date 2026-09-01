@@ -3,6 +3,81 @@ import AVKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+private struct CaptureDetailTextSnapshot: Sendable {
+    let originalContent: String
+    let context: String
+}
+
+/// Builds the potentially large detail payload without touching MainActor.
+/// CaptureDetailView used to synchronously reread the same files several times
+/// while SwiftUI was constructing its first frame.
+private enum CaptureDetailTextLoader {
+    static func load(
+        record: CaptureRecord,
+        originalURL: URL?,
+        tabURLs: [UUID: URL]
+    ) -> CaptureDetailTextSnapshot {
+        let originalContent = text(at: originalURL) ?? record.text ?? ""
+        let contextContent: String
+        switch record.kind {
+        case .text:
+            contextContent = originalContent.isEmpty ? "(Empty)" : originalContent
+        case .link:
+            contextContent = record.text?.isEmpty == false ? record.text! : record.sourceURL ?? "(Empty)"
+        case .image, .browserSnapshot:
+            contextContent = originalURL.map { "[Image] \($0.path)" }
+                ?? record.sourceURL.map { "[Image] \($0)" }
+                ?? "[Image unavailable]"
+        case .video:
+            contextContent = originalURL.map { "[Video] \($0.path)" }
+                ?? record.sourceURL.map { "[Video] \($0)" }
+                ?? "[Video unavailable]"
+        }
+
+        let context: String
+        if (record.tags ?? []).contains(where: { $0.hasPrefix("builtin:context:platform-search:") }) {
+            let description = record.itemDescription?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let heading = description.isEmpty ? record.title : "\(record.title) — \(description)"
+            let content = contextContent.trimmingCharacters(in: .whitespacesAndNewlines)
+            context = content.isEmpty ? heading : "\(heading)\n\(content)"
+        } else {
+            var sections = ["Title: \(record.title)"]
+            if let tags = record.tags, !tags.isEmpty {
+                sections.append("Tags: \(tags.joined(separator: ", "))")
+            }
+            if let description = record.itemDescription, !description.isEmpty {
+                sections.append("Description:\n\(description)")
+            }
+            sections.append("Content:\n\(contextContent)")
+            if let sourceURL = record.sourceURL,
+               !sourceURL.isEmpty,
+               !contextContent.contains(sourceURL) {
+                sections.append("Source: \(sourceURL)")
+            }
+            for tab in record.detailTabs ?? [] {
+                let value: String
+                switch tab.kind {
+                case .markdown, .plainText:
+                    let content = text(at: tabURLs[tab.id]) ?? ""
+                    value = content.isEmpty ? "(Empty)" : content
+                case .image, .video, .file:
+                    value = tab.fileName
+                }
+                sections.append("[\(tab.title)]:\n\(value)")
+            }
+            context = sections.joined(separator: "\n\n")
+        }
+        return CaptureDetailTextSnapshot(originalContent: originalContent, context: context)
+    }
+
+    private static func text(at url: URL?) -> String? {
+        guard let url,
+              let value = try? String(contentsOf: url, encoding: .utf8),
+              !value.isEmpty else { return nil }
+        return value
+    }
+}
+
 struct CaptureDetailView: View {
     private enum DetailSelection: Hashable {
         case defaultTab
@@ -71,13 +146,14 @@ struct CaptureDetailView: View {
         .background(Color.white)
         .background(DetailWindowConfigurator())
         .onExitCommand(perform: onClose)
-        .onAppear(perform: loadDefaultFields)
-        .onChange(of: record) { _, updatedRecord in
-            if let updatedRecord { refreshContextPreview(for: updatedRecord) }
+        .onAppear(perform: loadDefaultMetadata)
+        .task(id: record) {
+            guard let record else { return }
+            await loadTextSnapshot(for: record)
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             guard selectedTab == .defaultTab, let record else { return }
-            refreshContextPreview(for: record)
+            Task { await loadTextSnapshot(for: record) }
         }
         .alert("操作失败", isPresented: Binding(
             get: { errorMessage != nil },
@@ -225,7 +301,7 @@ struct CaptureDetailView: View {
                 record: record,
                 coverURL: store.coverURL(for: record),
                 posterURL: store.coverPreviewURL(for: record),
-                textContent: store.originalTextContent(for: record)
+                textContent: originalContent
             )
             .frame(width: 420, height: 320)
             .clipped()
@@ -501,9 +577,9 @@ struct CaptureDetailView: View {
                     unavailableOriginalContent
                 }
             case .text, .link:
-                if let text = store.originalTextContent(for: record) {
+                if !originalContent.isEmpty {
                     ScrollView {
-                        Text(text)
+                        Text(originalContent)
                             .font(.system(size: 16))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -693,7 +769,7 @@ struct CaptureDetailView: View {
             }
     }
 
-    private func loadDefaultFields() {
+    private func loadDefaultMetadata() {
         guard let record else { return }
         title = record.title
         tags = record.tags ?? []
@@ -701,16 +777,23 @@ struct CaptureDetailView: View {
         isAddingTag = false
         description = record.itemDescription ?? ""
         itemType = record.space ?? .context
-        originalContent = store.originalTextContent(for: record) ?? ""
         subagentTools = record.agentConfiguration?.tools.joined(separator: ", ") ?? ""
         subagentSkills = record.agentConfiguration?.skills.joined(separator: ", ") ?? ""
         subagentModel = record.agentConfiguration?.model ?? ""
         subagentFork = record.agentConfiguration?.fork ?? false
-        refreshContextPreview(for: record)
     }
 
-    private func refreshContextPreview(for record: CaptureRecord) {
-        contextPreview = store.context(for: record)
+    private func loadTextSnapshot(for record: CaptureRecord) async {
+        let originalURL = store.fileURL(for: record)
+        let tabURLs = Dictionary(uniqueKeysWithValues: (record.detailTabs ?? []).compactMap { tab in
+            store.fileURL(for: tab, in: record).map { (tab.id, $0) }
+        })
+        let snapshot = await Task.detached(priority: .userInitiated) {
+            CaptureDetailTextLoader.load(record: record, originalURL: originalURL, tabURLs: tabURLs)
+        }.value
+        guard self.record?.id == record.id else { return }
+        originalContent = snapshot.originalContent
+        contextPreview = snapshot.context
     }
 
     private func copyCurrentContext() {
@@ -745,7 +828,10 @@ struct CaptureDetailView: View {
         guard case let .file(id) = selection,
               let record,
               let tab = record.detailTabs?.first(where: { $0.id == id }) else {
-            if selection == .defaultTab { loadDefaultFields() }
+            if selection == .defaultTab {
+                loadDefaultMetadata()
+                if let record { Task { await loadTextSnapshot(for: record) } }
+            }
             return
         }
         tabContent = store.content(for: tab, in: record)
@@ -757,8 +843,10 @@ struct CaptureDetailView: View {
 
     private func saveAndCopyContext() {
         guard persistDefaultFields(), let record else { return }
-        refreshContextPreview(for: record)
-        copyCurrentContext()
+        Task {
+            await loadTextSnapshot(for: record)
+            copyCurrentContext()
+        }
     }
 
     @discardableResult
@@ -860,7 +948,7 @@ struct CaptureDetailView: View {
     private func saveTabContent(_ tab: CaptureDetailTab) {
         do {
             try store.saveContent(tabContent, for: tab.id, in: recordID)
-            if let record { refreshContextPreview(for: record) }
+            if let record { Task { await loadTextSnapshot(for: record) } }
         } catch {
             showError(error)
         }
@@ -871,7 +959,8 @@ struct CaptureDetailView: View {
         do {
             try store.deleteDetailTab(tab.id, from: recordID)
             selectedTab = .defaultTab
-            loadDefaultFields()
+            loadDefaultMetadata()
+            if let record { Task { await loadTextSnapshot(for: record) } }
         } catch {
             showError(error)
         }
@@ -949,7 +1038,7 @@ struct CaptureDetailView: View {
     }
 
     private func hasOriginalContent(_ record: CaptureRecord) -> Bool {
-        if store.originalTextContent(for: record) != nil { return true }
+        if record.text?.isEmpty == false || record.fileName != nil { return true }
         if let sourceURL = record.sourceURL, !sourceURL.isEmpty { return true }
         return store.fileURL(for: record) != nil
     }

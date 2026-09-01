@@ -66,6 +66,9 @@ test("preserves the pi-agent loop and progressively loads a Skill", async () => 
   assert.equal(output.final, "skill loaded");
   assert.ok(output.events.some((event) => event.type === "tool_execution_start"));
   assert.ok(output.events.some((event) => event.type === "tool_execution_end"));
+  for (const event of output.events.filter((candidate) => candidate.type.endsWith("message_update"))) {
+    assert.doesNotMatch(JSON.stringify(event), /\"partial\"|\"message\"/);
+  }
   assert.deepEqual(output.rounds?.[0]?.steps?.map((step) => step.type), ["reasoning", "tool-call", "tool-result"]);
   assert.equal(output.rounds?.[0]?.steps?.[0]?.type === "reasoning" && output.rounds[0].steps[0].text, "I should load the relevant skill.");
   assert.ok((output.messages?.length ?? 0) >= 4);

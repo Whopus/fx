@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { appendFile } from "node:fs/promises";
 import { once } from "node:events";
+import { createWriteStream } from "node:fs";
 import { resolve } from "node:path";
 import { executeAgent, loadNotebook, saveNotebook } from "./notebook.ts";
 import { compactStreamEvent } from "./event-stream.ts";
@@ -53,6 +53,20 @@ process.once("SIGINT", () => controller.abort());
 process.once("SIGTERM", () => controller.abort());
 const eventLog = option("--event-log");
 const eventStream = process.argv.includes("--event-stream");
+const eventLogStream = eventLog ? createWriteStream(resolve(eventLog), { flags: "a", encoding: "utf8" }) : undefined;
+
+async function writeEventLog(event: CuratezEvent): Promise<void> {
+  if (!eventLogStream) return;
+  if (eventLogStream.write(`${JSON.stringify(event)}\n`)) return;
+  await once(eventLogStream, "drain");
+}
+
+async function closeEventLog(): Promise<void> {
+  if (!eventLogStream) return;
+  eventLogStream.end();
+  await once(eventLogStream, "finish");
+}
+
 const runtime = new PiRuntime({
   model,
   resolveModel: (id) => resolveModel(registry.models, id),
@@ -70,7 +84,7 @@ const output = await executeAgent(
   {
     signal: controller.signal,
     onEvent: async (event) => {
-      if (eventLog) await appendFile(resolve(eventLog), `${JSON.stringify(event)}\n`, "utf8");
+      await writeEventLog(event);
       if (eventStream) await writeStreamEvent(event);
       if (event.type === "tool_execution_start") {
         const data = event.data as { toolName?: string };
@@ -79,7 +93,7 @@ const output = await executeAgent(
     },
   },
   { continue: process.argv.includes("--continue") },
-);
+).finally(closeEventLog);
 await saveNotebook(path, notebook);
 if (!eventStream) process.stdout.write(`${output.final}\n`);
 if (output.status !== "completed") process.exitCode = 1;

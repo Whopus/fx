@@ -39,6 +39,94 @@ struct ContextRunEvent: Codable, Equatable, Sendable {
     var parentToolCallId: String?
 }
 
+/// Coalesces adjacent token deltas before they cross onto the main actor.
+/// Structural events keep their exact order; only compatible incremental
+/// strings are joined, so the reconstructed activity is byte-for-byte equal.
+struct ContextRunEventBatcher {
+    private var pending: ContextRunEvent?
+    private var pendingCount = 0
+    private var pendingSince: TimeInterval?
+
+    mutating func consume(
+        _ event: ContextRunEvent,
+        now: TimeInterval = Date.timeIntervalSinceReferenceDate
+    ) -> [ContextRunEvent] {
+        guard Self.delta(in: event) != nil else {
+            var ready = flush()
+            ready.append(event)
+            return ready
+        }
+
+        if pending == nil {
+            pending = event
+            pendingCount = 1
+            pendingSince = now
+            return []
+        }
+
+        guard merge(event) else {
+            let ready = flush()
+            pending = event
+            pendingCount = 1
+            pendingSince = now
+            return ready
+        }
+
+        pendingCount += 1
+        if pendingCount >= 64 || now - (pendingSince ?? now) >= 0.1 {
+            return flush()
+        }
+        return []
+    }
+
+    mutating func flush() -> [ContextRunEvent] {
+        guard let pending else { return [] }
+        self.pending = nil
+        pendingCount = 0
+        pendingSince = nil
+        return [pending]
+    }
+
+    private mutating func merge(_ next: ContextRunEvent) -> Bool {
+        guard var current = pending,
+              current.type == next.type,
+              current.parentToolCallId == next.parentToolCallId,
+              let currentDelta = Self.delta(in: current),
+              let nextDelta = Self.delta(in: next),
+              currentDelta.kind == nextDelta.kind,
+              currentDelta.contentIndex == nextDelta.contentIndex,
+              case .object(var data) = current.data,
+              case .object(var update) = data["assistantMessageEvent"] else {
+            return false
+        }
+
+        update["delta"] = .string(currentDelta.text + nextDelta.text)
+        data["assistantMessageEvent"] = .object(update)
+        current.data = .object(data)
+        current.time = next.time
+        pending = current
+        return true
+    }
+
+    private static func delta(in event: ContextRunEvent) -> (kind: String, contentIndex: Double?, text: String)? {
+        guard event.type.hasSuffix("message_update"),
+              case .object(let data) = event.data,
+              case .object(let update) = data["assistantMessageEvent"],
+              case .string(let kind) = update["type"],
+              kind.hasSuffix("_delta"),
+              case .string(let text) = update["delta"] else {
+            return nil
+        }
+        let contentIndex: Double?
+        if case .number(let value) = update["contentIndex"] {
+            contentIndex = value
+        } else {
+            contentIndex = nil
+        }
+        return (kind, contentIndex, text)
+    }
+}
+
 struct ContextRunStep: Codable, Equatable, Sendable {
     var type: String
     var text: String?
@@ -184,21 +272,34 @@ struct ContextNotebookItem: Codable, Identifiable, Equatable, Sendable {
 /// introduced by that run.
 enum ContextOutputPresentation {
     static func rounds(for item: ContextNotebookItem, in items: [ContextNotebookItem]) -> [ContextRunRound] {
-        guard item.kind == .output,
-              let currentRounds = item.run?.rounds,
-              !currentRounds.isEmpty,
-              let itemIndex = items.firstIndex(where: { $0.id == item.id }) else {
-            return []
+        roundsByItem(in: items)[item.id] ?? []
+    }
+
+    /// Computes every output's delta in one forward pass. The editor renders all
+    /// output cards together, so repeatedly searching backward from each card
+    /// turns a long Session into quadratic work during unrelated UI updates.
+    static func roundsByItem(in items: [ContextNotebookItem]) -> [UUID: [ContextRunRound]] {
+        var result: [UUID: [ContextRunRound]] = [:]
+        result.reserveCapacity(items.count)
+        var previousRoundKeys = Set<String>()
+
+        for item in items where item.kind == .output {
+            guard let run = item.run else {
+                result[item.id] = []
+                continue
+            }
+            let currentRounds = run.rounds ?? []
+            guard !currentRounds.isEmpty else {
+                result[item.id] = []
+                previousRoundKeys.removeAll(keepingCapacity: true)
+                continue
+            }
+            result[item.id] = previousRoundKeys.isEmpty
+                ? currentRounds
+                : currentRounds.filter { !previousRoundKeys.contains(roundKey($0)) }
+            previousRoundKeys = Set(currentRounds.map(roundKey))
         }
-
-        let previousRounds = items[..<itemIndex]
-            .reversed()
-            .first(where: { $0.kind == .output && $0.run != nil })?
-            .run?.rounds ?? []
-        guard !previousRounds.isEmpty else { return currentRounds }
-
-        let previousKeys = Set(previousRounds.map(roundKey))
-        return currentRounds.filter { !previousKeys.contains(roundKey($0)) }
+        return result
     }
 
     private static func roundKey(_ round: ContextRunRound) -> String {
@@ -539,18 +640,26 @@ enum ContextPiRunner {
         process.standardOutput = outputPipe
         process.standardError = logHandle
 
-        let eventTask = Task {
+        // Reading and decoding a busy NDJSON stream must not inherit the
+        // caller's MainActor. Only compact, display-ready batches cross over.
+        let eventTask = Task.detached(priority: .userInitiated) {
+            var batcher = ContextRunEventBatcher()
             do {
                 for try await line in outputPipe.fileHandleForReading.bytes.lines {
                     guard let data = line.data(using: .utf8),
                           let event = try? JSONDecoder.curatez.decode(ContextRunEvent.self, from: data) else {
                         continue
                     }
-                    await onEvent(event)
+                    for ready in batcher.consume(event) {
+                        await onEvent(ready)
+                    }
                 }
             } catch {
                 // Process termination closes stdout. A complete run is decoded
                 // from the notebook below, so a pipe-close error is non-fatal.
+            }
+            for ready in batcher.flush() {
+                await onEvent(ready)
             }
         }
 

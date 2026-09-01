@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Agent, type AgentEvent, type AgentMessage, type AgentTool, type StreamFn } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { compactStreamEvent } from "./event-stream.ts";
 import type {
   CompiledRun,
   CuratezEvent,
@@ -86,14 +87,17 @@ export class PiRuntime implements CuratezRuntime {
     initialMessages: AgentMessage[],
   ): Promise<Omit<OutputCell, "id" | "type" | "forAgent">> {
     const startedAt = hooks.resume?.startedAt ?? new Date().toISOString();
-    const events: CuratezEvent[] = [...(hooks.resume?.events ?? [])];
+    // Older sessions may contain pi's cumulative `message` and `partial`
+    // snapshots on every token. Normalize them when resuming as well as when
+    // emitting new events so retained history stays linear in response size.
+    const events: CuratezEvent[] = (hooks.resume?.events ?? []).map(compactStreamEvent);
     const emit = async (type: string, data: unknown, parentToolCallId?: string) => {
-      const event: CuratezEvent = {
+      const event = compactStreamEvent({
         type,
         time: new Date().toISOString(),
         data,
         ...(parentToolCallId ? { parentToolCallId } : {}),
-      };
+      });
       events.push(event);
       await hooks.onEvent?.(event);
     };

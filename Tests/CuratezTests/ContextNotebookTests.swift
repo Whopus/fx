@@ -3,6 +3,44 @@ import XCTest
 @testable import Curatez
 
 final class ContextNotebookTests: XCTestCase {
+    func testLiveRunEventBatcherPreservesTextAndStructuralOrder() throws {
+        func delta(_ text: String, time: String = "2026-08-31T00:00:00Z") -> ContextRunEvent {
+            ContextRunEvent(
+                type: "message_update",
+                time: time,
+                data: .object([
+                    "type": .string("message_update"),
+                    "assistantMessageEvent": .object([
+                        "type": .string("text_delta"),
+                        "contentIndex": .number(0),
+                        "delta": .string(text)
+                    ])
+                ]),
+                parentToolCallId: nil
+            )
+        }
+
+        let ended = ContextRunEvent(
+            type: "message_end",
+            time: "2026-08-31T00:00:01Z",
+            data: .object(["type": .string("message_end")]),
+            parentToolCallId: nil
+        )
+        var batcher = ContextRunEventBatcher()
+        XCTAssertTrue(batcher.consume(delta("Hello"), now: 0).isEmpty)
+        XCTAssertTrue(batcher.consume(delta(", "), now: 0.01).isEmpty)
+        let emitted = batcher.consume(delta("world"), now: 0.02) + batcher.consume(ended, now: 0.03)
+
+        XCTAssertEqual(emitted.count, 2)
+        XCTAssertEqual(emitted[1], ended)
+        guard case .object(let data) = emitted[0].data,
+              case .object(let update) = data["assistantMessageEvent"],
+              case .string(let text) = update["delta"] else {
+            return XCTFail("Expected one compact text delta")
+        }
+        XCTAssertEqual(text, "Hello, world")
+    }
+
     func testFxModelSettingsLoadsStringsObjectsAndDefaultModel() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("CuratezFxModelSettings-\(UUID().uuidString).json")
@@ -509,6 +547,9 @@ final class ContextNotebookTests: XCTestCase {
         XCTAssertEqual(agentCells.filter { ($0["type"] as? String) == "query" }.count, 3)
         XCTAssertEqual(ContextOutputPresentation.rounds(for: firstOutput, in: notebook.items).map(\.final), ["First answer"])
         XCTAssertEqual(ContextOutputPresentation.rounds(for: secondOutput, in: notebook.items).map(\.final), ["Second answer"])
+        let roundsByItem = ContextOutputPresentation.roundsByItem(in: notebook.items)
+        XCTAssertEqual(roundsByItem[firstOutput.id]?.map(\.final), ["First answer"])
+        XCTAssertEqual(roundsByItem[secondOutput.id]?.map(\.final), ["Second answer"])
     }
 
     func testMarkdownParserPreservesBlockStructureAndInlineContent() {
