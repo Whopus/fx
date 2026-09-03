@@ -11,6 +11,7 @@ import {
   NodeExecutionEnv,
 } from "@earendil-works/pi-agent-core/node";
 import { Type } from "typebox";
+import { adaptTaobaoResult, searchBusinessError } from "./search/taobao.ts";
 
 const JUSTONEAPI_MCP_URL = "https://mcp.justoneapi.com/mcp";
 
@@ -189,6 +190,22 @@ export function createJustOneAPISearchTool(
         options.fetchImpl ?? fetch,
         signal,
       );
+
+      const businessError = searchBusinessError(value);
+      if (businessError) throw new Error(`Search failed: ${businessError}`);
+
+      const adapted = adaptTaobaoResult(endpointID, params.params ?? {}, value);
+      if (adapted) {
+        return {
+          content: [{ type: "text", text: adapted.text }],
+          details: {
+            operation: "search",
+            endpointID,
+            presentation: adapted.presentation,
+          },
+        };
+      }
+
       return {
         content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
         details: { operation: "search", endpointID },

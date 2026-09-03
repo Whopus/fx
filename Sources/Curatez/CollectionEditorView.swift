@@ -549,11 +549,15 @@ struct CollectionEditorView: View {
     @State private var markdownPreviewCache = ContextMarkdownPreviewCache()
     @State private var availableRecordsSnapshot: [CaptureRecord] = []
     @State private var availableRecordsByID: [UUID: CaptureRecord] = [:]
+    @State private var sessionArtifactsURL: URL?
     @State private var artifactRefreshRevision = 0
+    @State private var activeRunCancellation: ContextRunCancellation?
+    @State private var activeRunTask: Task<Void, Never>?
+    @State private var isStoppingRun = false
     @FocusState private var focusedEditorField: ContextEditorFocus?
 
     private var runtimeWorkingDirectoryURL: URL? {
-        store.selectedCollection.map(store.workingDirectoryURL(for:))
+        sessionArtifactsURL
     }
 
     private var availableRecords: [CaptureRecord] {
@@ -563,18 +567,6 @@ struct CollectionEditorView: View {
     private var libraryRecords: [CaptureRecord] {
         guard let space = libraryItemKind.captureSpace else { return [] }
         return availableRecords.filter { ($0.space ?? .context) == space }
-    }
-
-    private var managedLibraryItemPaths: Set<String> {
-        Set(availableRecords.compactMap { record in
-            store.containerURL(for: record)?.standardizedFileURL.path
-        })
-    }
-
-    private var artifactsUsesManagedLibraryRoot: Bool {
-        guard let collection = store.selectedCollection else { return false }
-        return runtimeWorkingDirectoryURL?.standardizedFileURL
-            == store.folderURL(for: collection).standardizedFileURL
     }
 
     var body: some View {
@@ -647,7 +639,7 @@ struct CollectionEditorView: View {
             .buttonStyle(.plain)
             .offset(y: -8)
 
-            ScrollView {
+            ContextThinVerticalScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(notebook.items.enumerated()), id: \.element.id) { index, item in
                         insertionControl(at: index)
@@ -661,13 +653,13 @@ struct CollectionEditorView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .scrollIndicators(.hidden)
             .padding(.top, 7)
+            .frame(minHeight: 190, idealHeight: 280, maxHeight: 340)
 
             ContextSessionArtifactsView(
                 rootURL: runtimeWorkingDirectoryURL,
-                excludedTopLevelPaths: managedLibraryItemPaths,
-                excludesManagedItemDirectories: artifactsUsesManagedLibraryRoot,
+                excludedTopLevelPaths: [],
+                excludesManagedItemDirectories: false,
                 refreshRevision: artifactRefreshRevision
             )
             .frame(minHeight: 190, idealHeight: 280, maxHeight: 340)
@@ -987,13 +979,17 @@ struct CollectionEditorView: View {
             .zIndex(100)
 
             HStack(spacing: 0) {
-                Button(action: performPrimaryAction) {
+                Button {
+                    if isRunning {
+                        stopRun()
+                    } else {
+                        performPrimaryAction()
+                    }
+                } label: {
                     HStack(spacing: 7) {
                         if isRunning {
-                            ProgressView()
-                                .controlSize(.small)
-                                .scaleEffect(0.75)
-                                .tint(.white)
+                            Image(systemName: isStoppingRun ? "hourglass" : "stop.fill")
+                                .font(.system(size: 9, weight: .bold))
                         } else {
                             Image(systemName: primaryAction.icon)
                                 .font(.system(size: 9, weight: .bold))
@@ -1009,6 +1005,7 @@ struct CollectionEditorView: View {
                 }
                 .buttonStyle(.plain)
                 .keyboardShortcut(.return, modifiers: [.command])
+                .disabled(isStoppingRun)
 
                 Rectangle()
                     .fill(.white.opacity(0.25))
@@ -1042,10 +1039,10 @@ struct CollectionEditorView: View {
                 .menuIndicator(.hidden)
                 .tint(.white)
                 .fixedSize()
+                .disabled(isRunning)
             }
             .background(.black)
             .clipShape(Capsule())
-            .disabled(isRunning)
         }
         .padding(.trailing, 16)
         .frame(height: 58)
@@ -1281,7 +1278,8 @@ struct CollectionEditorView: View {
     }
 
     private var primaryActionTitle: String {
-        if isRunning { return "Running" }
+        if isStoppingRun { return "Stopping" }
+        if isRunning { return "Stop" }
         if primaryAction == .save && didSaveSession { return "Saved" }
         return primaryAction.rawValue
     }
@@ -1299,7 +1297,7 @@ struct CollectionEditorView: View {
     private func saveCurrentSession() {
         do {
             let session = try store.upsertSession(notebook: notebook, sessionID: activeSessionID)
-            activeSessionID = session.id
+            try activateSessionWorkspace(session)
             shouldKeepSessionOnClose = true
             saveFeedbackGeneration += 1
             let generation = saveFeedbackGeneration
@@ -1469,22 +1467,35 @@ struct CollectionEditorView: View {
 
     private func queryEditor(_ item: Binding<ContextNotebookItem>) -> some View {
         let itemID = item.wrappedValue.id
+        let focus = ContextEditorFocus.body(itemID)
+        let focusBinding = Binding(
+            get: { focusedEditorField == focus },
+            set: { focused in
+                if focused {
+                    focusedEditorField = focus
+                } else if focusedEditorField == focus {
+                    focusedEditorField = nil
+                }
+            }
+        )
         return VStack(alignment: .leading, spacing: 0) {
-            TextField(
-                "",
+            ContextFastTextEditor(
                 text: item.body,
-                prompt: Text("Ask the agent…").foregroundStyle(.secondary.opacity(0.45)),
-                axis: .vertical
+                prompt: "Ask the agent…",
+                minHeight: 28,
+                maximumLines: 16,
+                isFocused: focusBinding,
+                fontSize: 20,
+                lineSpacing: 6,
+                usesPrimaryTextColor: true,
+                onPasteImage: {
+                    pasteImageIntoQuery(itemID)
+                }
             )
-            .textFieldStyle(.plain)
-            .font(.system(size: 20))
-            .lineSpacing(6)
-            .lineLimit(1...16)
             .frame(minHeight: 28, alignment: .top)
-            .focused($focusedEditorField, equals: .body(itemID))
             .contentShape(Rectangle())
             .simultaneousGesture(TapGesture().onEnded {
-                focusEditor(.body(itemID))
+                focusEditor(focus)
             })
 
             if item.wrappedValue.attachments?.isEmpty == false {
@@ -1546,7 +1557,7 @@ struct CollectionEditorView: View {
 
     private func pasteImageIntoQuery(_ itemID: UUID) {
         guard let index = notebook.items.firstIndex(where: { $0.id == itemID && $0.kind == .query }),
-              let image = NSImage(pasteboard: .general) else { return }
+              let image = ContextPasteboardImage.image(from: .general) else { return }
         let existingCount = notebook.items[index].attachments?.count ?? 0
         guard let data = queryImageData(from: image) else {
             errorMessage = "无法读取剪贴板中的图片。"
@@ -1801,7 +1812,12 @@ struct CollectionEditorView: View {
             if let run = item.run {
                 HStack(spacing: 8) {
                     Circle()
-                        .fill(run.status == "running" ? Color.secondary.opacity(0.48) : run.status == "completed" ? Color.green : Color.red)
+                        .fill(
+                            run.status == "running" ? Color.secondary.opacity(0.48)
+                                : run.status == "completed" ? Color.green
+                                : run.status == "stopped" ? Color.orange
+                                : Color.red
+                        )
                         .frame(width: 7, height: 7)
                     Text(run.status)
                     if let model = run.model { Text("· \(model)") }
@@ -2002,7 +2018,10 @@ struct CollectionEditorView: View {
         if let initialSessionID {
             do {
                 notebook = try store.notebook(forSession: initialSessionID)
-                activeSessionID = initialSessionID
+                guard let session = store.records.first(where: { $0.id == initialSessionID }) else {
+                    throw CaptureStoreError.sessionNotebookUnavailable
+                }
+                try activateSessionWorkspace(session)
                 shouldKeepSessionOnClose = true
             } catch {
                 notebook = ContextNotebook.fresh(title: collection.name)
@@ -2010,13 +2029,19 @@ struct CollectionEditorView: View {
             }
         } else {
             notebook = ContextNotebook.fresh(title: collection.name)
+            do {
+                let draft = try store.upsertSession(notebook: notebook, sessionID: nil)
+                try activateSessionWorkspace(draft)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
         selectedItemID = notebook.items.first?.id
         isLoaded = true
     }
 
     private func runContext() {
-        guard !isRunning, let runtimeWorkingDirectoryURL else { return }
+        guard !isRunning else { return }
         guard notebook.items.contains(where: {
             $0.hasQueryContent
         }) else {
@@ -2025,11 +2050,12 @@ struct CollectionEditorView: View {
         }
         do {
             let session = try store.upsertSession(notebook: notebook, sessionID: activeSessionID)
-            activeSessionID = session.id
+            try activateSessionWorkspace(session)
         } catch {
             errorMessage = error.localizedDescription
             return
         }
+        guard let runtimeWorkingDirectoryURL else { return }
         let records = availableRecords
         let contexts = Dictionary(uniqueKeysWithValues: records.map { ($0.id, store.context(for: $0)) })
         let mediaURLs = Dictionary(uniqueKeysWithValues: records.compactMap { record in
@@ -2040,7 +2066,8 @@ struct CollectionEditorView: View {
             collectionURL: runtimeWorkingDirectoryURL,
             records: records,
             contexts: contexts,
-            mediaURLs: mediaURLs
+            mediaURLs: mediaURLs,
+            continuationMessages: store.continuationMessages(forSession: activeSessionID)
         )
 
         let startedAt = Date()
@@ -2068,14 +2095,22 @@ struct CollectionEditorView: View {
         selectedItemID = outputID
         navigationTargetID = outputID
         isRunning = true
+        isStoppingRun = false
+        let cancellation = ContextRunCancellation()
+        activeRunCancellation = cancellation
 
-        Task { @MainActor in
+        activeRunTask = Task { @MainActor in
             defer {
                 isRunning = false
+                isStoppingRun = false
+                if activeRunCancellation === cancellation {
+                    activeRunCancellation = nil
+                    activeRunTask = nil
+                }
                 artifactRefreshRevision &+= 1
             }
             do {
-                let result = try await ContextPiRunner.run(payload) { event in
+                let result = try await ContextPiRunner.run(payload, cancellation: cancellation) { event in
                     guard liveOutputID == outputID else { return }
                     liveActivityStore.apply(event)
                 }
@@ -2085,40 +2120,41 @@ struct CollectionEditorView: View {
                 liveOutputID = nil
                 selectedItemID = outputID
                 let session = try store.upsertSession(notebook: notebook, sessionID: activeSessionID)
-                activeSessionID = session.id
-                compactInMemoryRunState(keepingMessagesIn: outputID)
+                try activateSessionWorkspace(session)
+                compactInMemoryRunState()
             } catch {
-                let failed = ContextRunResult(
-                    status: "failed",
+                let wasStopped = cancellation.isCancellationRequested
+                let finalResult = ContextRunResult(
+                    status: wasStopped ? "stopped" : "failed",
                     runtime: "pi",
                     model: fxModelSettings.resolvedModel(explicitModel: notebook.model),
-                    error: error.localizedDescription,
+                    error: wasStopped ? nil : error.localizedDescription,
                     final: "",
                     events: [],
                     startedAt: startedAt,
                     endedAt: Date()
                 )
                 if let index = notebook.items.firstIndex(where: { $0.id == outputID }) {
-                    notebook.items[index].run = failed
+                    notebook.items[index].run = finalResult
                 }
                 liveOutputID = nil
                 if let session = try? store.upsertSession(notebook: notebook, sessionID: activeSessionID) {
-                    activeSessionID = session.id
+                    try? activateSessionWorkspace(session)
                 }
-                compactInMemoryRunState(keepingMessagesIn: outputID)
-                errorMessage = error.localizedDescription
+                compactInMemoryRunState()
+                if !wasStopped {
+                    errorMessage = error.localizedDescription
+                }
             }
         }
     }
 
-    /// UI rendering only needs rounds and the final answer. Keep continuation
-    /// messages on the newest output, while raw events remain in events.json.
-    private func compactInMemoryRunState(keepingMessagesIn outputID: UUID) {
+    /// UI rendering only needs rounds and the final answer. The complete
+    /// continuation transcript lives in the Session's messages.json artifact.
+    private func compactInMemoryRunState() {
         for index in notebook.items.indices where notebook.items[index].kind == .output {
             notebook.items[index].run?.events = nil
-            if notebook.items[index].id != outputID {
-                notebook.items[index].run?.messages = nil
-            }
+            notebook.items[index].run?.messages = nil
         }
     }
 
@@ -2192,10 +2228,22 @@ struct CollectionEditorView: View {
         isCloseConfirmationPresented = true
     }
 
+    private func stopRun() {
+        guard isRunning, !isStoppingRun else { return }
+        isStoppingRun = true
+        activeRunCancellation?.cancel()
+        activeRunTask?.cancel()
+    }
+
+    private func activateSessionWorkspace(_ session: CaptureRecord) throws {
+        activeSessionID = session.id
+        sessionArtifactsURL = try store.artifactsDirectoryURL(forSession: session.id)
+    }
+
     private func saveAndCloseEditor() {
         do {
             let session = try store.upsertSession(notebook: notebook, sessionID: activeSessionID)
-            activeSessionID = session.id
+            try activateSessionWorkspace(session)
             shouldKeepSessionOnClose = true
             onClose()
         } catch {
@@ -2442,11 +2490,17 @@ private struct ContextFastTextEditor: NSViewRepresentable {
     let minHeight: CGFloat
     let maximumLines: Int
     let isFocused: Binding<Bool>?
+    var fontSize: CGFloat = 13
+    var lineSpacing: CGFloat = 4
+    var usesPrimaryTextColor = false
+    var onPasteImage: (() -> Void)? = nil
 
-    private let font = NSFont.systemFont(ofSize: 13)
-    private let lineSpacing: CGFloat = 4
+    private var font: NSFont { .systemFont(ofSize: fontSize) }
 
     private var contentColor: NSColor {
+        if usesPrimaryTextColor {
+            return .labelColor
+        }
         guard let resolved = NSColor.secondaryLabelColor.usingColorSpace(.deviceRGB) else {
             return NSColor.secondaryLabelColor
         }
@@ -2494,6 +2548,7 @@ private struct ContextFastTextEditor: NSViewRepresentable {
         textView.placeholder = prompt
         textView.placeholderFont = font
         textView.placeholderColor = NSColor.secondaryLabelColor.withAlphaComponent(0.45)
+        textView.onPasteImage = onPasteImage
         textView.string = text
         applyTypography(to: textView)
 
@@ -2512,6 +2567,7 @@ private struct ContextFastTextEditor: NSViewRepresentable {
         textView.placeholderColor = NSColor.secondaryLabelColor.withAlphaComponent(0.45)
         textView.font = font
         textView.textColor = contentColor
+        textView.onPasteImage = onPasteImage
 
         if textView.string != text {
             let selection = textView.selectedRange()
@@ -2622,6 +2678,16 @@ private final class ContextPromptTextView: NSTextView {
     var placeholder = "" { didSet { if oldValue != placeholder { needsDisplay = true } } }
     var placeholderFont: NSFont = .systemFont(ofSize: 15)
     var placeholderColor: NSColor = .placeholderTextColor
+    var onPasteImage: (() -> Void)?
+
+    override func paste(_ sender: Any?) {
+        guard onPasteImage != nil,
+              ContextPasteboardImage.image(from: .general) != nil else {
+            super.paste(sender)
+            return
+        }
+        onPasteImage?()
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
@@ -2637,6 +2703,40 @@ private final class ContextPromptTextView: NSTextView {
                 .paragraphStyle: paragraph
             ]
         )
+    }
+}
+
+private enum ContextPasteboardImage {
+    static func image(from pasteboard: NSPasteboard) -> NSImage? {
+        if let image = NSImage(pasteboard: pasteboard) {
+            return image
+        }
+
+        let imageTypes: [NSPasteboard.PasteboardType] = [
+            .png,
+            .tiff,
+            NSPasteboard.PasteboardType("public.jpeg"),
+            NSPasteboard.PasteboardType("com.compuserve.gif"),
+            NSPasteboard.PasteboardType("public.heic")
+        ]
+        for type in imageTypes {
+            if let data = pasteboard.data(forType: type),
+               let image = NSImage(data: data) {
+                return image
+            }
+        }
+
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [
+            .urlReadingFileURLsOnly: true
+        ]
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL] {
+            for url in urls where UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true {
+                if let image = NSImage(contentsOf: url) {
+                    return image
+                }
+            }
+        }
+        return nil
     }
 }
 

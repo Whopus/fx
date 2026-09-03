@@ -7,6 +7,7 @@ import { createProvider, type Api, type Model, type Models } from "@earendil-wor
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
+import { googleGenerativeAIApi } from "@earendil-works/pi-ai/api/google-generative-ai.lazy";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 
 const execFileAsync = promisify(execFile);
@@ -184,6 +185,112 @@ export async function loadModelRegistry(
     })));
   };
 
+  const registerConfiguredOpenAICompletionsProvider = (
+    providerId: string,
+    baseUrl: string,
+    apiKey: string,
+    source: string,
+    definitions: PiModelDefinition[],
+    providerCompat: Record<string, unknown> = {},
+  ) => {
+    registerOpenAIProvider(providerId, baseUrl, apiKey, source, definitions.map((definition) => ({
+      id: definition.id,
+      name: definition.name ?? definition.id,
+      reasoning: definition.reasoning ?? false,
+      input: definition.input ?? ["text"],
+      cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: definition.contextWindow ?? 1_000_000,
+      maxTokens: definition.maxTokens ?? 128_000,
+      compat: { ...providerCompat, ...(definition.compat ?? {}) } as NonNullable<Model<"openai-completions">["compat"]>,
+    })));
+  };
+
+  const registerAnthropicMessagesProvider = (
+    providerId: string,
+    baseUrl: string,
+    apiKey: string,
+    source: string,
+    definitions: PiModelDefinition[],
+    providerCompat: Record<string, unknown> = {},
+  ) => {
+    const providerModels = definitions.map((definition): Model<"anthropic-messages"> => ({
+      id: definition.id,
+      name: definition.name ?? definition.id,
+      api: "anthropic-messages",
+      provider: providerId,
+      baseUrl,
+      reasoning: definition.reasoning ?? false,
+      input: definition.input ?? ["text"],
+      cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: definition.contextWindow ?? 200_000,
+      maxTokens: definition.maxTokens ?? 8_192,
+      compat: { ...providerCompat, ...(definition.compat ?? {}) } as NonNullable<Model<"anthropic-messages">["compat"]>,
+    }));
+    models.setProvider(createProvider({
+      id: providerId,
+      name: providerId,
+      baseUrl,
+      auth: {
+        apiKey: {
+          name: `${providerId} API key`,
+          check: async () => ({ type: "api_key", source }),
+          resolve: async () => ({ auth: { apiKey }, source }),
+        },
+      },
+      models: providerModels,
+      api: anthropicMessagesApi(),
+    }));
+    configured.push(...providerModels.map((model) => ({
+      spec: `${providerId}/${model.id}`,
+      name: model.name,
+      provider: providerId,
+      input: [...model.input],
+      reasoning: model.reasoning,
+    })));
+  };
+
+  const registerGoogleGenerativeAIProvider = (
+    providerId: string,
+    baseUrl: string,
+    apiKey: string,
+    source: string,
+    definitions: PiModelDefinition[],
+  ) => {
+    const providerModels = definitions.map((definition): Model<"google-generative-ai"> => ({
+      id: definition.id,
+      name: definition.name ?? definition.id,
+      api: "google-generative-ai",
+      provider: providerId,
+      baseUrl,
+      reasoning: definition.reasoning ?? false,
+      input: definition.input ?? ["text"],
+      cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: definition.contextWindow ?? 1_000_000,
+      maxTokens: definition.maxTokens ?? 65_536,
+    }));
+    models.setProvider(createProvider({
+      id: providerId,
+      name: providerId,
+      baseUrl,
+      auth: {
+        apiKey: {
+          name: `${providerId} API key`,
+          check: async () => ({ type: "api_key", source }),
+          resolve: async () => ({ auth: { apiKey }, source }),
+        },
+      },
+      models: providerModels,
+      api: googleGenerativeAIApi(),
+    }));
+    configured.push(...providerModels.map((model) => ({
+      spec: `${providerId}/${model.id}`,
+      name: model.name,
+      provider: providerId,
+      input: [...model.input],
+      reasoning: model.reasoning,
+    })));
+  };
+
   const reposRoot = process.env.CURATEZ_REPOS_ROOT ?? process.env.FX_REPOS_ROOT ?? resolve(homedir(), "repos");
   const deepseekEnvPath = process.env.CURATEZ_DEEPSEEK_ENV ?? process.env.FX_DEEPSEEK_ENV ?? resolve(reposRoot, "soda/benchmarks/.env");
   const deepseekEnv = await readEnv(deepseekEnvPath);
@@ -243,56 +350,45 @@ export async function loadModelRegistry(
     ...(fxSettings?.providers ?? {}),
   };
   for (const [providerId, definition] of Object.entries(externalProviders)) {
-    if (!definition.baseUrl || !definition.models?.length || definition.api !== "openai-responses") continue;
+    if (!definition.baseUrl || !definition.models?.length) continue;
     const credential = await providerCredential(definition);
     if (!credential) continue;
-    registerOpenAIResponsesProvider(
-      providerId,
-      definition.baseUrl,
-      credential.apiKey,
-      credential.source,
-      definition.models,
-      definition.compat,
-    );
-  }
-
-  for (const [providerId, definition] of Object.entries(file?.providers ?? {})) {
-    if (!definition.apiKey || !definition.baseUrl || definition.api !== "anthropic-messages" || !definition.models?.length) continue;
-    const apiKey = definition.apiKey;
-    const providerModels = definition.models.map((item): Model<"anthropic-messages"> => ({
-      id: item.id,
-      name: item.name ?? item.id,
-      api: "anthropic-messages",
-      provider: providerId,
-      baseUrl: definition.baseUrl!,
-      reasoning: item.reasoning ?? false,
-      input: item.input ?? ["text"],
-      cost: item.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: item.contextWindow ?? 200_000,
-      maxTokens: item.maxTokens ?? 8_192,
-      compat: { ...(definition.compat ?? {}), ...(item.compat ?? {}) },
-    }));
-    models.setProvider(createProvider({
-      id: providerId,
-      name: providerId,
-      baseUrl: definition.baseUrl,
-      auth: {
-        apiKey: {
-          name: `${providerId} API key`,
-          check: async () => ({ type: "api_key", source: "~/.pi/agent/models.json" }),
-          resolve: async () => ({ auth: { apiKey }, source: "~/.pi/agent/models.json" }),
-        },
-      },
-      models: providerModels,
-      api: anthropicMessagesApi(),
-    }));
-    configured.push(...providerModels.map((model) => ({
-      spec: `${providerId}/${model.id}`,
-      name: model.name,
-      provider: providerId,
-      input: [...model.input],
-      reasoning: model.reasoning,
-    })));
+    if (definition.api === "openai-responses") {
+      registerOpenAIResponsesProvider(
+        providerId,
+        definition.baseUrl,
+        credential.apiKey,
+        credential.source,
+        definition.models,
+        definition.compat,
+      );
+    } else if (definition.api === "openai-completions") {
+      registerConfiguredOpenAICompletionsProvider(
+        providerId,
+        definition.baseUrl,
+        credential.apiKey,
+        credential.source,
+        definition.models,
+        definition.compat,
+      );
+    } else if (definition.api === "anthropic-messages") {
+      registerAnthropicMessagesProvider(
+        providerId,
+        definition.baseUrl,
+        credential.apiKey,
+        credential.source,
+        definition.models,
+        definition.compat,
+      );
+    } else if (definition.api === "google-generative-ai") {
+      registerGoogleGenerativeAIProvider(
+        providerId,
+        definition.baseUrl,
+        credential.apiKey,
+        credential.source,
+        definition.models,
+      );
+    }
   }
 
   const piDefault = settings?.defaultProvider && settings.defaultModel

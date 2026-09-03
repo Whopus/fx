@@ -673,6 +673,28 @@ final class CaptureStore: ObservableObject {
         itemFolderURL(for: record)
     }
 
+    /// Each Session owns a dedicated workspace for Agent and tool output. Keeping
+    /// it beneath the Session record prevents one Session's artifacts from
+    /// appearing in another Session's sidebar.
+    func artifactsDirectoryURL(forSession sessionID: UUID) throws -> URL {
+        guard let record = records.first(where: {
+            $0.id == sessionID && $0.space == .session && !$0.isTrashed
+        }), let sessionURL = itemFolderURL(for: record) else {
+            throw CaptureStoreError.sessionNotebookUnavailable
+        }
+
+        let artifactsURL = sessionURL.appendingPathComponent("Artifacts", isDirectory: true)
+        var isDirectory = ObjCBool(false)
+        if fileManager.fileExists(atPath: artifactsURL.path, isDirectory: &isDirectory) {
+            guard isDirectory.boolValue else {
+                throw CaptureStoreError.sessionArtifactsUnavailable
+            }
+        } else {
+            try fileManager.createDirectory(at: artifactsURL, withIntermediateDirectories: true)
+        }
+        return artifactsURL.standardizedFileURL
+    }
+
     func replaceCover(for id: UUID, with image: NSImage) throws {
         guard let data = image.pngData else { throw CaptureStoreError.imageEncodingFailed }
         try replaceCoverData(data, for: id)
@@ -1146,17 +1168,11 @@ final class CaptureStore: ObservableObject {
         }
 
         let latestOutputIndex = notebook.items.lastIndex(where: { $0.kind == .output && $0.run != nil })
-        let fallbackMessages = latestOutputIndex.flatMap { notebook.items[$0].run?.messages }
         for index in notebook.items.indices where notebook.items[index].kind == .output {
             notebook.items[index].run?.messages = nil
             notebook.items[index].run?.events = nil
         }
         if let latestOutputIndex, var latestRun = notebook.items[latestOutputIndex].run {
-            latestRun.messages = decodeArtifact(
-                [JSONValue].self,
-                named: "messages.json",
-                in: itemURL
-            ) ?? fallbackMessages
             if latestRun.rounds == nil {
                 latestRun.rounds = decodeArtifact(
                     [ContextRunRound].self,
@@ -1181,6 +1197,19 @@ final class CaptureStore: ObservableObject {
             try? compactData.write(to: notebookURL, options: [.atomic])
         }
         return notebook
+    }
+
+    /// The agent transcript is intentionally kept outside the SwiftUI notebook
+    /// value. It is loaded only when starting a continuation run.
+    func continuationMessages(forSession sessionID: UUID?) -> [JSONValue]? {
+        guard let sessionID,
+              let record = records.first(where: {
+                  $0.id == sessionID && $0.space == .session && !$0.isTrashed
+              }),
+              let itemURL = itemFolderURL(for: record) else {
+            return nil
+        }
+        return decodeArtifact([JSONValue].self, named: "messages.json", in: itemURL)
     }
 
     /// Persist the editor into one stable Session record. A nil or stale id
@@ -1783,6 +1812,7 @@ enum CaptureStoreError: LocalizedError {
     case invalidDetailTabType
     case workingDirectoryUnavailable
     case sessionNotebookUnavailable
+    case sessionArtifactsUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -1799,6 +1829,7 @@ enum CaptureStoreError: LocalizedError {
         case .invalidDetailTabType: "图片、视频和其他文件请使用导入文件。"
         case .workingDirectoryUnavailable: "所选工作目录不存在或无法访问。"
         case .sessionNotebookUnavailable: "这个 Session 缺少可编辑的 notebook 数据。"
+        case .sessionArtifactsUnavailable: "这个 Session 的 Artifacts 目录不可用。"
         }
     }
 }

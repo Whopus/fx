@@ -435,7 +435,7 @@ final class ContextNotebookTests: XCTestCase {
                 startedAt: "2026-08-30T00:00:00Z",
                 endedAt: "2026-08-30T00:00:01Z"
             )],
-            messages: messages,
+            messages: nil,
             events: [ContextRunEvent(
                 type: "tool_execution_end",
                 time: "2026-08-30T00:00:01Z",
@@ -452,7 +452,8 @@ final class ContextNotebookTests: XCTestCase {
             collectionURL: FileManager.default.temporaryDirectory,
             records: [],
             contexts: [:],
-            mediaURLs: [:]
+            mediaURLs: [:],
+            continuationMessages: messages
         )
 
         let data = try ContextPiRunner.makeRuntimeNotebook(payload, queryID: secondQuery.id)
@@ -862,7 +863,7 @@ final class ContextNotebookTests: XCTestCase {
     }
 
     @MainActor
-    func testNotebookExternalizesHeavyEventsButRehydratesContinuationMessages() throws {
+    func testNotebookExternalizesHeavyEventsAndContinuationMessages() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("CuratezCompactSession-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -905,8 +906,9 @@ final class ContextNotebookTests: XCTestCase {
 
         let reloaded = CaptureStore(rootURL: root)
         let editable = try reloaded.notebook(forSession: session.id)
-        XCTAssertEqual(editable.items.last?.run?.messages, messages)
+        XCTAssertNil(editable.items.last?.run?.messages)
         XCTAssertNil(editable.items.last?.run?.events)
+        XCTAssertEqual(reloaded.continuationMessages(forSession: session.id), messages)
     }
 
     @MainActor
@@ -981,7 +983,36 @@ final class ContextNotebookTests: XCTestCase {
         XCTAssertNil(persistedNotebook.items.last?.run?.messages)
         XCTAssertNil(persistedNotebook.items.last?.run?.events)
         let editableNotebook = try store.notebook(forSession: updated.id)
-        XCTAssertEqual(editableNotebook.items.last?.run?.messages, messages)
+        XCTAssertNil(editableNotebook.items.last?.run?.messages)
         XCTAssertNil(editableNotebook.items.last?.run?.events)
+        XCTAssertEqual(store.continuationMessages(forSession: updated.id), messages)
+    }
+
+    @MainActor
+    func testSessionArtifactsWorkspaceIsCreatedInsideItsSessionFolder() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CuratezSessionArtifactsWorkspace-(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = CaptureStore(rootURL: root)
+        let session = try store.upsertSession(
+            notebook: ContextNotebook.fresh(title: "New Session"),
+            sessionID: nil
+        )
+        let sessionURL = try XCTUnwrap(store.containerURL(for: session))
+        let artifactsURL = try store.artifactsDirectoryURL(forSession: session.id)
+
+        XCTAssertEqual(artifactsURL.deletingLastPathComponent(), sessionURL)
+        XCTAssertEqual(artifactsURL.lastPathComponent, "Artifacts")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: artifactsURL.path))
+    }
+
+    func testRunCancellationRecordsAStopRequest() {
+        let cancellation = ContextRunCancellation()
+        XCTAssertFalse(cancellation.isCancellationRequested)
+
+        cancellation.cancel()
+
+        XCTAssertTrue(cancellation.isCancellationRequested)
     }
 }

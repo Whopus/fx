@@ -559,6 +559,7 @@ enum ContextNotebookError: LocalizedError {
     case runtimeNotFound
     case nodeNotFound
     case malformedOutput
+    case cancelled
     case launchFailed(String)
 
     var errorDescription: String? {
@@ -571,6 +572,8 @@ enum ContextNotebookError: LocalizedError {
             "找不到 Node.js。Curatez Agent Runtime 需要 Node.js 22.19 或更高版本。"
         case .malformedOutput:
             "pi agent 已结束，但没有生成可读取的 Output Cell。"
+        case .cancelled:
+            "运行已停止。"
         case .launchFailed(let message):
             "无法运行 pi agent：\(message)"
         }
@@ -583,11 +586,75 @@ struct ContextRuntimePayload: Sendable {
     let records: [CaptureRecord]
     let contexts: [UUID: String]
     let mediaURLs: [UUID: URL]
+    /// Persisted separately from the notebook UI state so a large tool
+    /// transcript cannot be copied during SwiftUI view reconciliation.
+    let continuationMessages: [JSONValue]?
+
+    init(
+        notebook: ContextNotebook,
+        collectionURL: URL,
+        records: [CaptureRecord],
+        contexts: [UUID: String],
+        mediaURLs: [UUID: URL],
+        continuationMessages: [JSONValue]? = nil
+    ) {
+        self.notebook = notebook
+        self.collectionURL = collectionURL
+        self.records = records
+        self.contexts = contexts
+        self.mediaURLs = mediaURLs
+        self.continuationMessages = continuationMessages
+    }
+}
+
+/// Coordinates cancellation across the SwiftUI task and the spawned Node process.
+/// Process is not Sendable, so access is protected by this lock-bound reference.
+final class ContextRunCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancellationRequested = false
+
+    var isCancellationRequested: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellationRequested
+    }
+
+    func register(_ process: Process) {
+        lock.lock()
+        self.process = process
+        let shouldTerminate = cancellationRequested
+        lock.unlock()
+
+        if shouldTerminate, process.isRunning {
+            process.terminate()
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancellationRequested = true
+        let process = process
+        lock.unlock()
+
+        if let process, process.isRunning {
+            process.terminate()
+        }
+    }
+
+    func finish(_ process: Process) {
+        lock.lock()
+        if self.process === process {
+            self.process = nil
+        }
+        lock.unlock()
+    }
 }
 
 enum ContextPiRunner {
     static func run(
         _ payload: ContextRuntimePayload,
+        cancellation: ContextRunCancellation? = nil,
         onEvent: @escaping @MainActor @Sendable (ContextRunEvent) -> Void = { _ in }
     ) async throws -> ContextRunResult {
         let query = payload.notebook.items.last {
@@ -671,6 +738,7 @@ enum ContextPiRunner {
                 }
                 do {
                     try process.run()
+                    cancellation?.register(process)
                 } catch {
                     process.terminationHandler = nil
                     continuation.resume(throwing: error)
@@ -680,12 +748,18 @@ enum ContextPiRunner {
             eventTask.cancel()
             try? outputPipe.fileHandleForReading.close()
             try? outputPipe.fileHandleForWriting.close()
+            cancellation?.finish(process)
             throw error
         }
         try? outputPipe.fileHandleForWriting.close()
         await eventTask.value
         try? outputPipe.fileHandleForReading.close()
         try? logHandle.close()
+        cancellation?.finish(process)
+
+        if cancellation?.isCancellationRequested == true {
+            throw ContextNotebookError.cancelled
+        }
 
         if let result = try? decodeResult(from: notebookURL) {
             return result
@@ -793,12 +867,18 @@ enum ContextPiRunner {
             "version": 1,
             "id": payload.notebook.id.uuidString.lowercased(),
             "title": payload.notebook.title,
-            "cells": [agent] + (try previousRuntimeOutput(from: payload.notebook).map { [$0] } ?? [])
+            "cells": [agent] + (try previousRuntimeOutput(
+                from: payload.notebook,
+                continuationMessages: payload.continuationMessages
+            ).map { [$0] } ?? [])
         ]
         return try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
     }
 
-    private static func previousRuntimeOutput(from notebook: ContextNotebook) throws -> [String: Any]? {
+    private static func previousRuntimeOutput(
+        from notebook: ContextNotebook,
+        continuationMessages: [JSONValue]?
+    ) throws -> [String: Any]? {
         guard let result = notebook.items.last(where: { $0.kind == .output && $0.run != nil })?.run else {
             return nil
         }
@@ -817,7 +897,9 @@ enum ContextPiRunner {
         if let model = result.model { output["model"] = model }
         if let error = result.error { output["error"] = error }
         if let rounds = result.rounds { output["rounds"] = try jsonObject(rounds) }
-        if let messages = result.messages { output["messages"] = try jsonObject(messages) }
+        if let messages = continuationMessages ?? result.messages {
+            output["messages"] = try jsonObject(messages)
+        }
         if let usage = result.usage { output["usage"] = try jsonObject(usage) }
         return output
     }

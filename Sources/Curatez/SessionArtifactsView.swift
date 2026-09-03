@@ -16,6 +16,124 @@ struct SessionArtifactVisibleRow: Identifiable, Hashable {
     var id: String { entry.id }
 }
 
+private struct ContextThinScrollMetrics: Equatable {
+    let scrollID: UUID
+    let viewportHeight: CGFloat?
+    let contentHeight: CGFloat?
+    let contentMinY: CGFloat?
+}
+
+private struct ContextThinScrollMetricsKey: PreferenceKey {
+    static let defaultValue: [ContextThinScrollMetrics] = []
+
+    static func reduce(
+        value: inout [ContextThinScrollMetrics],
+        nextValue: () -> [ContextThinScrollMetrics]
+    ) {
+        value.append(contentsOf: nextValue())
+    }
+}
+
+/// A compact, always-readable scroll position marker for narrow sidebar lists.
+/// The marker is deliberately drawn only when the list actually overflows.
+struct ContextThinVerticalScrollView<Content: View>: View {
+    private let content: Content
+    @State private var scrollID = UUID()
+    @State private var viewportHeight: CGFloat = 0
+    @State private var contentHeight: CGFloat = 0
+    @State private var contentMinY: CGFloat = 0
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    private var hasOverflow: Bool {
+        contentHeight > viewportHeight + 1
+    }
+
+    private var thumbHeight: CGFloat {
+        guard contentHeight > 0 else { return 0 }
+        return min(28, max(12, viewportHeight * viewportHeight / contentHeight))
+    }
+
+    private var thumbOffset: CGFloat {
+        let scrollableHeight = max(contentHeight - viewportHeight, 1)
+        let availableTrackHeight = max(viewportHeight - thumbHeight, 0)
+        let progress = min(max(-contentMinY / scrollableHeight, 0), 1)
+        return progress * availableTrackHeight
+    }
+
+    var body: some View {
+        ScrollView {
+            content
+                .background(
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: ContextThinScrollMetricsKey.self,
+                            value: [
+                                ContextThinScrollMetrics(
+                                    scrollID: scrollID,
+                                    viewportHeight: nil,
+                                    contentHeight: proxy.size.height,
+                                    contentMinY: proxy.frame(in: .named(scrollID)).minY
+                                )
+                            ]
+                        )
+                    }
+                )
+        }
+        .scrollIndicators(.hidden)
+        .coordinateSpace(name: scrollID)
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: ContextThinScrollMetricsKey.self,
+                    value: [
+                        ContextThinScrollMetrics(
+                            scrollID: scrollID,
+                            viewportHeight: proxy.size.height,
+                            contentHeight: nil,
+                            contentMinY: nil
+                        )
+                    ]
+                )
+            }
+        )
+        .onPreferenceChange(ContextThinScrollMetricsKey.self) { metrics in
+            guard let content = metrics.last(where: {
+                $0.scrollID == scrollID && $0.contentHeight != nil
+            }), let viewport = metrics.last(where: {
+                $0.scrollID == scrollID && $0.viewportHeight != nil
+            }) else {
+                return
+            }
+
+            if let height = content.contentHeight,
+               abs(contentHeight - height) > 0.5 {
+                contentHeight = height
+            }
+            if let minY = content.contentMinY,
+               abs(contentMinY - minY) > 0.5 {
+                contentMinY = minY
+            }
+            if let height = viewport.viewportHeight,
+               abs(viewportHeight - height) > 0.5 {
+                viewportHeight = height
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            if hasOverflow {
+                Capsule()
+                    .fill(.black.opacity(0.82))
+                    .frame(width: 2, height: thumbHeight)
+                    .padding(.trailing, 1)
+                    .offset(y: thumbOffset)
+                    .accessibilityHidden(true)
+            }
+        }
+    }
+}
+
 @MainActor
 final class SessionArtifactTreeModel: ObservableObject {
     @Published private(set) var rootURL: URL?
@@ -215,16 +333,7 @@ struct ContextSessionArtifactsView: View {
             .padding(.top, 12)
 
             if let rootURL = model.rootURL {
-                Text(rootURL.lastPathComponent)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary.opacity(0.52))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(rootURL.path)
-                    .padding(.top, 2)
-                    .padding(.bottom, 7)
-
-                ScrollView {
+                ContextThinVerticalScrollView {
                     if visibleRows.isEmpty,
                        !model.loadingDirectories.contains(rootURL) {
                         Text("No artifacts yet")
@@ -240,7 +349,6 @@ struct ContextSessionArtifactsView: View {
                         }
                     }
                 }
-                .scrollIndicators(.hidden)
             } else {
                 Text("No working directory")
                     .font(.system(size: 11))

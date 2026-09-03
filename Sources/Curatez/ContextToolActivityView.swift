@@ -544,6 +544,10 @@ struct ContextToolActivityView: View {
         )
     }
 
+    private var taobaoCall: ContextTaobaoSearchCall? {
+        ContextTaobaoSearchCall.parse(arguments)
+    }
+
     private var resultPresentation: ContextToolPresentation? {
         guard isResultRunning || resultPayload != nil || resultText != nil else { return nil }
         return .make(name: name, payload: resultPayload, fallbackText: resultText ?? "Completed", isResult: true)
@@ -574,7 +578,22 @@ struct ContextToolActivityView: View {
         ) ?? "Completed"
     }
 
+    @ViewBuilder
     var body: some View {
+        if let taobaoCall {
+            ContextTaobaoSearchActivityView(
+                call: taobaoCall,
+                resultPayload: resultPayload,
+                resultText: resultText,
+                isRunning: isResultRunning,
+                isError: isResultError
+            )
+        } else {
+            genericBody
+        }
+    }
+
+    private var genericBody: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: presentation.icon)
