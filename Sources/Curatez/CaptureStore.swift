@@ -1667,6 +1667,15 @@ final class CaptureStore: ObservableObject {
                   let data = try? Data(contentsOf: child.appendingPathComponent("metadata.json")),
                   var record = try? decoder.decode(CaptureRecord.self, from: data) else { continue }
             record.containerFolderName = child.lastPathComponent
+            // Keep metadata.json in sync with the content file on disk. Older
+            // builds (and external edits) could leave the stored `text` stale.
+            if let fileName = record.fileName,
+               record.kind == .text || record.kind == .link,
+               let fileText = try? String(contentsOf: child.appendingPathComponent(fileName), encoding: .utf8),
+               record.text != fileText {
+                record.text = fileText
+                try? writeMetadata(record, to: child)
+            }
             loadedRecords.append(record)
         }
         records = loadedRecords.sorted { $0.createdAt > $1.createdAt }
@@ -1696,6 +1705,15 @@ final class CaptureStore: ObservableObject {
     }
 
     private func writeMetadata(_ record: CaptureRecord, to itemURL: URL) throws {
+        // `text` must always mirror the primary content file, so every metadata
+        // write refreshes it first. This keeps metadata.json timely instead of
+        // carrying whatever snapshot happened to be in memory.
+        var record = record
+        if let fileName = record.fileName,
+           record.kind == .text || record.kind == .link,
+           let fileText = try? String(contentsOf: itemURL.appendingPathComponent(fileName), encoding: .utf8) {
+            record.text = fileText
+        }
         let data = try JSONEncoder.curatez.encode(record)
         try data.write(to: itemURL.appendingPathComponent("metadata.json"), options: .atomic)
     }
