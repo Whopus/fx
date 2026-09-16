@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "id": "fx-runtime-smoke",
+  "title": "Fx Runtime Smoke Test",
+  "cells": [
+    {
+      "id": "fx-agent",
+      "type": "agent",
+      "name": "Fx Runtime Smoke Test",
+      "reasoning": "low",
+      "toolExecution": "parallel",
+      "cells": [
+        {
+          "id": "system-smoke",
+          "type": "system",
+          "content": "Follow the user's output format exactly."
+        },
+        {
+          "id": "query-smoke",
+          "type": "query",
+          "content": [
+            {
+              "type": "text",
+              "text": "Reply with exactly FX_RUNTIME_OK and nothing else."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
