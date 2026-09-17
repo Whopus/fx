@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import Darwin
 import SwiftUI
 
 private enum MainWindowMetrics {
@@ -64,9 +65,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private weak var previouslyActiveApplication: NSRunningApplication?
     private var hasEstablishedInitialState = false
     private var isTransitioning = false
+    /// Held for the process lifetime so the kernel releases it automatically on
+    /// exit, even after a crash. This closes the race where two near-simultaneous
+    /// launches each fail to see the other and both keep running.
+    private var instanceLockDescriptor: Int32 = -1
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if handOffToExistingInstanceIfNeeded() {
+        guard acquireSingleInstanceLock() else {
+            handOffToExistingInstance()
             return
         }
 
@@ -102,25 +108,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    private func handOffToExistingInstanceIfNeeded() -> Bool {
-        guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return false }
-
-        let currentPID = ProcessInfo.processInfo.processIdentifier
-        guard let existingInstance = NSRunningApplication
-            .runningApplications(withBundleIdentifier: bundleIdentifier)
-            .first(where: { $0.processIdentifier != currentPID })
-        else {
+    private func acquireSingleInstanceLock() -> Bool {
+        let lockURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("com.fx.desktop.single-instance.lock")
+        let descriptor = Darwin.open(lockURL.path, O_CREAT | O_RDWR, 0o644)
+        // If the lock cannot be created, fail open rather than block launching.
+        guard descriptor >= 0 else { return true }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            Darwin.close(descriptor)
             return false
         }
+        instanceLockDescriptor = descriptor
+        return true
+    }
 
+    private func handOffToExistingInstance() {
         DistributedNotificationCenter.default().post(
             name: Self.reopenNotification,
             object: nil,
             userInfo: nil
         )
-        existingInstance.activate(options: [.activateAllWindows])
+        if let bundleIdentifier = Bundle.main.bundleIdentifier {
+            let currentPID = ProcessInfo.processInfo.processIdentifier
+            if let existing = NSRunningApplication
+                .runningApplications(withBundleIdentifier: bundleIdentifier)
+                .first(where: { $0.processIdentifier != currentPID }) {
+                existing.activate(options: [.activateAllWindows])
+            }
+        }
         NSApp.terminate(nil)
-        return true
     }
 
     @objc

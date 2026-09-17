@@ -22,6 +22,7 @@ struct ContentView: View {
     @EnvironmentObject private var captureStore: CaptureStore
 
     @State private var gallerySpace: CaptureSpace = .context
+    @State private var menuPresence = GlassMenuPresence.shared
     @State private var columnCount = 4.0
     @State private var isAddPresented = false
     @State private var isEditPresented = false
@@ -102,6 +103,16 @@ struct ContentView: View {
                 }
                 .transition(.opacity)
                 .zIndex(10)
+            }
+
+            // The glass menus are hosted above this view, so SwiftUI never sees
+            // the menu as the topmost hit target. While one is open, claim the
+            // hover region here so cards underneath do not light up.
+            if menuPresence.isOpen {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onHover { _ in }
+                    .zIndex(20)
             }
         }
         .sheet(isPresented: $isAddPresented) {
@@ -549,6 +560,7 @@ struct ContentView: View {
                 TextEditor(text: text)
                     .font(.system(size: 13))
                     .scrollContentBackground(.hidden)
+                    .scrollIndicators(.never)
                     .padding(7)
             }
             .frame(height: height)
@@ -564,7 +576,7 @@ struct ContentView: View {
     private var typedTitlePrompt: String {
         return switch gallerySpace {
         case .system: "System Instructions"
-        case .tool: "echo"
+        case .tool: "tool_name"
         case .skill: "research"
         case .subagent: "scout"
         default: gallerySpace.displayName
@@ -677,6 +689,7 @@ struct ContentView: View {
                 TextEditor(text: $newText)
                     .font(.system(size: 14))
                     .scrollContentBackground(.hidden)
+                    .scrollIndicators(.never)
                     .padding(.vertical, 8)
                     .padding(.horizontal, -5)
                     .frame(height: 170)

@@ -584,6 +584,9 @@ enum ContextNotebookError: LocalizedError {
 struct ContextRuntimePayload: Sendable {
     let notebook: ContextNotebook
     let collectionURL: URL
+    /// Folder that owns the project `extensions/` directory. Defaults to the
+    /// collection working directory; `collectionURL` stays the process cwd.
+    let projectDirectoryURL: URL?
     let contexts: [UUID: String]
     let mediaURLs: [UUID: URL]
     /// Persisted separately from the notebook UI state so a large tool
@@ -593,12 +596,14 @@ struct ContextRuntimePayload: Sendable {
     init(
         notebook: ContextNotebook,
         collectionURL: URL,
+        projectDirectoryURL: URL? = nil,
         contexts: [UUID: String],
         mediaURLs: [UUID: URL],
         continuationMessages: [JSONValue]? = nil
     ) {
         self.notebook = notebook
         self.collectionURL = collectionURL
+        self.projectDirectoryURL = projectDirectoryURL
         self.contexts = contexts
         self.mediaURLs = mediaURLs
         self.continuationMessages = continuationMessages
@@ -608,6 +613,7 @@ struct ContextRuntimePayload: Sendable {
 struct ContextRuntimePreparation: Sendable {
     let notebook: ContextNotebook
     let collectionURL: URL
+    let projectDirectoryURL: URL?
     let textSources: [CaptureTextSource]
     let mediaURLs: [UUID: URL]
     let continuationURL: URL?
@@ -627,6 +633,7 @@ struct ContextRuntimePreparation: Sendable {
         try Task.checkCancellation()
         return ContextRuntimePayload(
             notebook: notebook, collectionURL: collectionURL,
+            projectDirectoryURL: projectDirectoryURL,
             contexts: contexts, mediaURLs: mediaURLs, continuationMessages: messages
         )
     }
@@ -676,6 +683,49 @@ final class ContextRunCancellation: @unchecked Sendable {
     }
 }
 
+/// Metadata for every builtin and extension-provided Tool/Skill/Subagent in a
+/// project, decoded from `fx-runtime catalog`.
+struct RuntimeCatalog: Decodable, Sendable {
+    struct Tool: Decodable, Sendable, Identifiable {
+        let name: String
+        let label: String?
+        let description: String
+        let builtin: Bool?
+        var id: String { name }
+    }
+
+    struct Skill: Decodable, Sendable, Identifiable {
+        let name: String
+        let description: String
+        let instructions: String?
+        var id: String { name }
+    }
+
+    struct Subagent: Decodable, Sendable, Identifiable {
+        let name: String
+        let description: String
+        let system: String?
+        let tools: [String]?
+        let skills: [String]?
+        let model: String?
+        let fork: Bool?
+        var id: String { name }
+    }
+
+    struct Diagnostic: Decodable, Sendable, Identifiable {
+        let file: String
+        let message: String
+        var id: String { file + message }
+    }
+
+    let tools: [Tool]
+    let skills: [Skill]
+    let subagents: [Subagent]
+    let diagnostics: [Diagnostic]
+
+    static let empty = RuntimeCatalog(tools: [], skills: [], subagents: [], diagnostics: [])
+}
+
 enum ContextPiRunner {
     static func run(
         _ payload: ContextRuntimePayload,
@@ -688,6 +738,68 @@ enum ContextPiRunner {
             return try await execute(payload, cancellation: cancellation, onEvent: onEvent)
         } onCancel: {
             cancellation.cancel()
+        }
+    }
+
+    /// Load the project catalog so the Tool/Skill/Subagent pickers can list the
+    /// builtins plus every discovered `extensions/*.ts` entry. Running the
+    /// catalog never starts an Agent or reads provider credentials.
+    static func catalog(projectDirectoryURL: URL) async throws -> RuntimeCatalog {
+        let runtimeCLI = try findRuntimeCLI()
+        let nodeURL = try findNode()
+        let logURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fx-catalog-\(UUID().uuidString).log")
+        FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        let logHandle = try FileHandle(forWritingTo: logURL)
+        defer {
+            try? logHandle.close()
+            try? FileManager.default.removeItem(at: logURL)
+        }
+
+        let process = Process()
+        process.executableURL = nodeURL
+        process.arguments = [
+            runtimeCLI.path,
+            "catalog",
+            "--project-dir",
+            projectDirectoryURL.path
+        ]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = logHandle
+
+        // Drain stdout while the child runs so a large catalog cannot fill the
+        // pipe buffer and deadlock the process before it exits.
+        let readHandle = output.fileHandleForReading
+        async let body: Data = {
+            var data = Data()
+            while let chunk = try? readHandle.read(upToCount: 1 << 16), !chunk.isEmpty {
+                data.append(chunk)
+            }
+            return data
+        }()
+
+        let status: Int32 = try await withCheckedThrowingContinuation { continuation in
+            process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
+            do {
+                try process.run()
+            } catch {
+                process.terminationHandler = nil
+                continuation.resume(throwing: error)
+            }
+        }
+        let data = await body
+        try? readHandle.close()
+
+        guard status == 0 else {
+            let log = (try? String(contentsOf: logURL, encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            throw ContextNotebookError.launchFailed(log.isEmpty ? "catalog exited \(status)" : log)
+        }
+        do {
+            return try JSONDecoder().decode(RuntimeCatalog.self, from: data)
+        } catch {
+            throw ContextNotebookError.malformedOutput
         }
     }
 
@@ -735,7 +847,13 @@ enum ContextPiRunner {
             eventLogURL.path,
             "--event-stream"
         ]
-        if payload.notebook.items.contains(where: { $0.kind == .output && $0.run?.messages?.isEmpty == false }) {
+        if let projectDirectoryURL = payload.projectDirectoryURL {
+            arguments += ["--project-dir", projectDirectoryURL.path]
+        }
+        // The transcript lives in messages.json, not in the SwiftUI notebook
+        // value (compaction clears `run.messages`), so decide continuation from
+        // the prepared artifact rather than the in-memory run state.
+        if payload.continuationMessages?.isEmpty == false {
             arguments.append("--continue")
         }
         arguments += FxModelSettings.load().resolvedModel(explicitModel: payload.notebook.model).map {

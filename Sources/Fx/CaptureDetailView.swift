@@ -269,6 +269,7 @@ struct CaptureDetailView: View {
                     TextEditor(text: $description)
                         .font(.system(size: 13))
                         .scrollContentBackground(.hidden)
+                        .scrollIndicators(.never)
                         .padding(.leading, -5)
                         .padding(.vertical, 3)
                         .frame(minHeight: 52)
@@ -547,6 +548,7 @@ struct CaptureDetailView: View {
             TextEditor(text: $originalContent)
                 .font(.system(size: 14, design: itemType == .query ? .default : .monospaced))
                 .scrollContentBackground(.hidden)
+                .scrollIndicators(.never)
                 .padding(16)
         }
     }
@@ -647,6 +649,7 @@ struct CaptureDetailView: View {
                 TextEditor(text: $tabContent)
                     .font(.system(size: 14, design: tab.kind == .markdown ? .monospaced : .default))
                     .scrollContentBackground(.hidden)
+                    .scrollIndicators(.never)
                     .padding(14)
             } else if let fileURL = store.fileURL(for: tab, in: record) {
                 DetailFilePreview(url: fileURL, kind: tab.kind)

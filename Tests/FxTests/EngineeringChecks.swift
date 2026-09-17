@@ -51,6 +51,17 @@ enum EngineeringChecks {
             try require(counts[space, default: 0] == expected, "Item Types menu changed type counts")
         }
         try require(ItemTypeMenu.counts(in: [])[.context, default: 0] == 0, "Empty menu count changed")
+
+        // The native menu rows must mirror the counts and mark the current
+        // selection, since AppKit draws the checkmark and badge from these.
+        let options = ItemTypeMenu.options(selection: .query, records: records)
+        try require(options.map(\.space) == CaptureSpace.allCases, "Native menu lost or reordered item types")
+        try require(options.filter(\.selected).map(\.space) == [.query], "Native menu selected the wrong type")
+        for option in options {
+            try require(option.title == option.space.displayName && !option.icon.isEmpty,
+                        "Native menu row lost its title or icon")
+            try require(option.count == counts[option.space, default: 0], "Native menu row count diverged")
+        }
         print("PASS: item type counts, legacy context classification, and trash exclusion")
     }
 
@@ -103,11 +114,7 @@ enum EngineeringChecks {
         let unavailable = entries.filter { $0.kind != .action || !$0.enabled }
         navigation.move(by: 1, in: unavailable)
         try require(navigation.highlighted == nil && navigation.activation(in: unavailable) == nil, "Empty/disabled menus have an active action")
-        let catalog = [GlassMenuEntry.heading("Item Types", detail: "选择一种类型进行查看和管理")]
-            + CaptureSpace.allCases.map { GlassMenuEntry(id: $0.rawValue, title: $0.displayName, detail: $0.summary) }
-        let height = catalog.reduce(CGFloat(16)) { $0 + GlassMenuDensity.catalog.height(of: $1) } + CGFloat(catalog.count - 1) * 2
-        try require(height == 462, "Item Types menu height changed")
-        print("PASS: shared glass navigation, disabled items, submenu actions, and catalog geometry")
+        print("PASS: shared glass navigation, disabled items, and submenu actions")
     }
 
     private static func checkContextCompression() throws {
@@ -183,17 +190,35 @@ enum EngineeringChecks {
     private static func checkBuiltinReloads(in root: URL) throws {
         let store = CaptureStore(rootURL: root)
         let collectionID = store.selectedCollectionID!
-        let installed = try store.installBuiltinToolsIfNeeded()
-        try require(Set(installed.map(\.title)) == ["read", "edit", "bash", "write", "search"], "Builtin declarations changed")
-        try require(try store.installBuiltinToolsIfNeeded().isEmpty, "Builtin reload duplicated or rewrote declarations")
-        var external = installed[0]
-        external.title = "Externally changed"
-        let metadataURL = store.containerURL(for: external)!.appendingPathComponent("metadata.json")
-        try JSONEncoder.fx.encode(external).write(to: metadataURL, options: .atomic)
+
+        // Legacy installers wrote builtin Tool cards into every collection, and
+        // an older one duplicated them. The one-time purge must trash exactly
+        // those cards and leave user-authored Tool cards alone.
+        let legacy = try store.saveAgentItem(space: .tool, title: "read", detail: "Legacy", body: "Legacy")
+        try store.updateDetails(
+            for: legacy.id,
+            title: "read",
+            tags: ["tool", "builtin", "builtin:tool:read"],
+            description: "Legacy"
+        )
+        let userTool = try store.saveAgentItem(space: .tool, title: "my_tool", detail: "User", body: "User")
+        try store.updateDetails(for: userTool.id, title: "my_tool", tags: ["tool"], description: "User")
         store.selectCollection(collectionID)
-        try require(store.records.first { $0.id == external.id }?.title == external.title, "Startup cache hid a subsequent disk edit")
-        let repaired = try store.installBuiltinToolsIfNeeded()
-        try require(repaired.count == 1 && repaired[0].id == external.id, "Builtin update lost identity or read stale metadata")
+
+        try store.purgeLegacyBuiltinToolCardsIfNeeded()
+        try require(store.records.first { $0.id == legacy.id } == nil, "Legacy builtin Tool card survived the purge")
+        try require(store.records.first { $0.id == userTool.id } != nil, "The purge removed a user-authored Tool card")
+
+        // The migration marks itself complete, so a second pass is a no-op.
+        let later = try store.saveAgentItem(space: .tool, title: "edit", detail: "Legacy", body: "Legacy")
+        try store.updateDetails(
+            for: later.id,
+            title: "edit",
+            tags: ["tool", "builtin", "builtin:tool:edit"],
+            description: "Legacy"
+        )
+        try store.purgeLegacyBuiltinToolCardsIfNeeded()
+        try require(store.records.first { $0.id == later.id } != nil, "The purge migration ran twice")
 
         let promptURL = root.appendingPathComponent("prompt.md")
         try "System instructions".write(to: promptURL, atomically: true, encoding: .utf8)

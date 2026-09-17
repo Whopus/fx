@@ -27,7 +27,12 @@ export function compileAgent(notebook: FxNotebook, agentId: string): CompiledRun
   const active = agent.cells;
   const outputs = new Map(notebook.cells.filter((cell): cell is OutputCell => cell.type === "output").map((cell) => [cell.id, cell]));
   const queries = active.filter((cell) => cell.type === "query").map((cell) => ({ cell, content: cell.content }));
-  const query = queries.flatMap((round) => round.content) as QueryPart[];
+  // One Run is one request: the last Query Cell is the pending turn, while
+  // every earlier Query Cell is history. So the trigger always lives on the
+  // last Query, never on N independent rounds.
+  const pending = queries.at(-1);
+  if (!pending) throw new Error(`Agent ${agentId} has no Query`);
+  const query = pending.content as QueryPart[];
   if (!query.some((part) => part.type === "text" ? part.text.trim() : part.data)) throw new Error(`Agent ${agentId} has no Query`);
   return {
     agent,

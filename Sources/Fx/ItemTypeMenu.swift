@@ -1,5 +1,11 @@
 import SwiftUI
 
+/// The gallery's item-type selector.
+///
+/// The options are drawn with the app's liquid-glass surface instead of the
+/// system `NSMenu`, whose material cannot carry the same clear, refractive
+/// look. The rows stay compact and single-line so the control still reads like
+/// a native pop-up menu.
 struct ItemTypeMenu: View {
     @Environment(\.colorScheme) private var scheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -7,15 +13,13 @@ struct ItemTypeMenu: View {
     let records: [CaptureRecord]
 
     var body: some View {
-        let counts = Self.counts(in: records)
-        let entries = [GlassMenuEntry.heading("Item Types", detail: "选择一种类型进行查看和管理")]
-            + CaptureSpace.allCases.map { space in
-                GlassMenuEntry(id: space.rawValue, title: space.displayName, icon: space.pickerIcon,
-                    detail: space.summary, count: counts[space, default: 0], selected: selection == space) {
-                        withAnimation(.easeOut(duration: 0.16)) { selection = space }
-                    }
+        let entries = Self.options(selection: selection, records: records).map { option in
+            GlassMenuEntry(id: option.space.rawValue, title: option.title, icon: option.icon,
+                           count: option.count, selected: option.selected) {
+                withAnimation(.easeOut(duration: 0.16)) { self.selection = option.space }
             }
-        GlassMenu(entries: entries, width: 316, density: .catalog, accessibilityTitle: "Item Types") {
+        }
+        GlassMenu(entries: entries, width: 224, density: .compact, accessibilityTitle: "Item Types") {
             HStack(spacing: 5) {
                 Image(systemName: selection.pickerIcon)
                     .symbolRenderingMode(.monochrome).foregroundStyle(.secondary)
@@ -32,6 +36,23 @@ struct ItemTypeMenu: View {
         }
         .fixedSize()
         .accessibilityValue(selection.displayName)
+    }
+
+    /// A testable row description so the menu can be verified without opening it.
+    struct Option: Equatable {
+        let space: CaptureSpace
+        let title: String
+        let icon: String
+        let count: Int
+        let selected: Bool
+    }
+
+    static func options(selection: CaptureSpace, records: [CaptureRecord]) -> [Option] {
+        let counts = counts(in: records)
+        return CaptureSpace.allCases.map { space in
+            Option(space: space, title: space.displayName, icon: space.pickerIcon,
+                   count: counts[space, default: 0], selected: selection == space)
+        }
     }
 
     static func counts(in records: [CaptureRecord]) -> [CaptureSpace: Int] {

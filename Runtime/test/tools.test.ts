@@ -40,7 +40,7 @@ test("coding tools bind pi implementations to the current Collection", async () 
     const tools = builtinTools(cwd);
     assert.deepEqual(
       tools.map((tool) => tool.name),
-      ["echo", "read", "edit", "bash", "write", "search"],
+      ["read", "edit", "bash", "write", "search"],
     );
 
     const write = tools.find((tool) => tool.name === "write");

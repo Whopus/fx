@@ -553,9 +553,12 @@ private struct ContextMarkdownTableView: View {
 
     var body: some View {
         let widths = columnWidths
+        let totalWidth = widths.reduce(0, +)
         ScrollView(.horizontal) {
-            Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
-                GridRow(alignment: .top) {
+            VStack(alignment: .leading, spacing: 0) {
+                rule(width: totalWidth, opacity: 0.45)
+
+                HStack(alignment: .top, spacing: 0) {
                     ForEach(Array(headers.enumerated()), id: \.offset) { column, text in
                         cell(
                             text,
@@ -566,8 +569,10 @@ private struct ContextMarkdownTableView: View {
                     }
                 }
 
+                rule(width: totalWidth, opacity: 0.28, height: 0.5)
+
                 ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
-                    GridRow(alignment: .top) {
+                    HStack(alignment: .top, spacing: 0) {
                         ForEach(Array(headers.indices), id: \.self) { column in
                             cell(
                                 row.indices.contains(column) ? row[column] : "",
@@ -578,17 +583,17 @@ private struct ContextMarkdownTableView: View {
                         }
                     }
                 }
+
+                rule(width: totalWidth, opacity: 0.45)
             }
-            .overlay(alignment: .top) { outerRule }
-            .overlay(alignment: .bottom) { outerRule }
         }
         .scrollIndicators(.never)
     }
 
-    private var outerRule: some View {
+    private func rule(width: CGFloat, opacity: Double, height: CGFloat = 1) -> some View {
         Rectangle()
-            .fill(Color.secondary.opacity(0.45))
-            .frame(height: 1)
+            .fill(Color.secondary.opacity(opacity))
+            .frame(width: width, height: height)
             .allowsHitTesting(false)
             .accessibilityHidden(true)
     }
@@ -608,16 +613,6 @@ private struct ContextMarkdownTableView: View {
             .padding(.horizontal, 11)
             .padding(.vertical, isHeader ? 9 : 8)
             .frame(width: width, alignment: cellAlignment(alignment))
-            .frame(maxHeight: .infinity, alignment: cellAlignment(alignment))
-            .overlay(alignment: .bottom) {
-                if isHeader {
-                    Rectangle()
-                        .fill(Color.secondary.opacity(0.28))
-                        .frame(height: 0.5)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                }
-            }
     }
 
     private func estimatedWidth(_ source: String) -> CGFloat {

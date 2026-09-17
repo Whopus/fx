@@ -52,6 +52,19 @@ locked dependencies, model registry, agent loop integration, Tool registry,
 progressive Skill loading, Subagent isolation/forking, events, usage, and resume
 support inside `Fx.app`. It does not execute code from `~/repos/fx`.
 
+Tools, Skills, and Subagents are declared by TypeScript files in an
+`extensions/` folder: the collection's working directory plus the global
+`~/.fx/extensions`. The Context editor picks them from the live catalog instead
+of saving declaration cards into each Collection. See
+[docs/extensions.md](docs/extensions.md).
+
+Search has two backends. With a platform Context selected, `search` calls an
+exact JustOneAPI endpoint. Without one, it queries the live web and returns
+ranked title/URL/snippet/ref_id results. Web search reuses Codex credentials
+from `~/.codex` (a ChatGPT token in `auth.json`, or `OPENAI_API_KEY`). Override
+with `CODEX_SEARCH_MODE=auto|chatgpt|api`, `CODEX_SEARCH_BASE_URL`,
+`CODEX_SEARCH_CHATGPT_URL`, `CODEX_SEARCH_PROXY`, or `CODEX_SEARCH_TIMEOUT_MS`.
+
 A saved Session contains `session.md`, `notebook.json`, `runtime-output.json`,
 `messages.json`, `events.json`, `rounds.json`, and (when reported by the
 provider) `usage.json`. Appending another Query resumes from the persisted pi

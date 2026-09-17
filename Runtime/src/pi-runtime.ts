@@ -3,6 +3,7 @@ import { Agent, type AgentEvent, type AgentMessage, type AgentTool, type StreamF
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { compactStreamEvent } from "./event-stream.ts";
+import type { FxSkillDefinition, FxSubagentDefinition } from "./extensions.ts";
 import type {
   CompiledRun,
   FxEvent,
@@ -10,6 +11,7 @@ import type {
   FxRuntime,
   OutputCell,
   RunHooks,
+  SkillCell,
   SubagentCell,
 } from "./types.ts";
 
@@ -17,6 +19,8 @@ export interface PiRuntimeOptions {
   model: Model<Api>;
   streamFn: StreamFn;
   tools?: AgentTool<any>[];
+  skills?: FxSkillDefinition[];
+  subagents?: FxSubagentDefinition[];
   resolveModel?: (id: string) => Model<Api> | undefined;
   maxSubagentDepth?: number;
 }
@@ -26,16 +30,16 @@ function assistantText(event: AgentEvent): string {
   return event.message.content.filter((part) => part.type === "text").map((part) => part.text).join("");
 }
 
-function systemPrompt(compiled: CompiledRun): string {
+function systemPrompt(compiled: CompiledRun, skills: SkillCell[], subagents: SubagentCell[]): string {
   const sections = compiled.system.map((cell) => cell.content.trim()).filter(Boolean);
   if (compiled.context.length) {
     sections.push(`<context>\n${compiled.context.map((item) => item.value).join("\n\n")}\n</context>`);
   }
-  if (compiled.skills.length) {
-    sections.push(`<available_skills>\n${compiled.skills.map((skill) => `${skill.name}: ${skill.description}`).join("\n")}\nUse load_skill when a skill is relevant.\n</available_skills>`);
+  if (skills.length) {
+    sections.push(`<available_skills>\n${skills.map((skill) => `${skill.name}: ${skill.description}`).join("\n")}\nUse load_skill when a skill is relevant.\n</available_skills>`);
   }
-  if (compiled.subagents.length) {
-    sections.push(`<available_subagents>\n${compiled.subagents.map((agent) => `${agent.name}: ${agent.description}`).join("\n")}\nUse subagent for independent delegated work.\n</available_subagents>`);
+  if (subagents.length) {
+    sections.push(`<available_subagents>\n${subagents.map((agent) => `${agent.name}: ${agent.description}`).join("\n")}\nUse subagent for independent delegated work.\n</available_subagents>`);
   }
   return sections.join("\n\n");
 }
@@ -108,7 +112,24 @@ export class PiRuntime implements FxRuntime {
     const missing = [...selected].filter((name) => !available.has(name));
     if (missing.length) throw new Error(`Unregistered Tool Cell: ${missing.join(", ")}`);
 
-    const skillMap = new Map(compiled.skills.map((skill) => [skill.name, skill]));
+    // A notebook Skill/Subagent Cell is the opt-in reference; the extension
+    // registry supplies the definition. A cell that embeds its own body keeps
+    // working, so older notebooks stay self-contained.
+    const skills = this.resolveSkills(compiled);
+    const subagents = this.resolveSubagents(compiled);
+    const allSkills = new Map<string, SkillCell>();
+    for (const skill of this.options.skills ?? []) {
+      allSkills.set(skill.name, {
+        id: `extension-skill-${skill.name}`,
+        type: "skill",
+        name: skill.name,
+        description: skill.description,
+        instructions: skill.instructions,
+      });
+    }
+    for (const skill of skills) allSkills.set(skill.name, skill);
+
+    const skillMap = new Map(skills.map((skill) => [skill.name, skill]));
     if (skillMap.size) {
       tools.push({
         name: "load_skill",
@@ -123,21 +144,30 @@ export class PiRuntime implements FxRuntime {
       });
     }
 
-    const subagentMap = new Map(compiled.subagents.map((subagent) => [subagent.name, subagent]));
+    const subagentMap = new Map(subagents.map((subagent) => [subagent.name, subagent]));
     const forkSnapshots = new Map<string, AgentMessage[]>();
     if (subagentMap.size && this.depth < (this.options.maxSubagentDepth ?? 1)) {
-      tools.push(this.subagentTool(subagentMap, skillMap, forkSnapshots, emit, hooks));
+      tools.push(this.subagentTool(subagentMap, allSkills, forkSnapshots, emit, hooks));
     }
 
     const model = compiled.agent.model ? this.options.resolveModel?.(compiled.agent.model) : this.options.model;
     if (!model) throw new Error(`Unknown model: ${compiled.agent.model}`);
+    // Seed earlier Query Cells as user turns on the first run only. A resumed
+    // run already carries them inside the persisted transcript, so seeding
+    // again would duplicate the conversation.
+    const seededMessages: AgentMessage[] = [...initialMessages];
+    if (!hooks.resume) {
+      for (const query of compiled.queries.slice(0, -1)) {
+        seededMessages.push({ role: "user", content: query.content } as AgentMessage);
+      }
+    }
     const agent = new Agent({
       initialState: {
-        systemPrompt: systemPrompt(compiled),
+        systemPrompt: systemPrompt(compiled, skills, subagents),
         model,
         thinkingLevel: compiled.agent.reasoning ?? "low",
         tools,
-        messages: initialMessages,
+        messages: seededMessages,
       },
       streamFn: this.options.streamFn,
       toolExecution: compiled.agent.toolExecution ?? "parallel",
@@ -153,7 +183,6 @@ export class PiRuntime implements FxRuntime {
     let final = hooks.resume?.final ?? "";
     let roundFinal = "";
     const rounds = [...(hooks.resume?.rounds ?? [])];
-    const completed = rounds.length;
     const unsubscribe = agent.subscribe(async (event) => {
       await emit(event.type, event);
       const text = assistantText(event);
@@ -172,38 +201,39 @@ export class PiRuntime implements FxRuntime {
         .map((attachment) => ({ type: "image" as const, data: attachment.data, mimeType: attachment.mediaType }));
       let status: "completed" | "failed" | "aborted" = "completed";
       let lastAssistant: Extract<AgentMessage, { role: "assistant" }> | undefined;
-      for (const [pendingIndex, query] of compiled.queries.slice(completed).entries()) {
-        hooks.signal?.throwIfAborted();
-        const roundIndex = completed + pendingIndex;
-        const roundStartedAt = new Date().toISOString();
-        roundFinal = "";
-        await emit("fx/round_start", { round: roundIndex + 1, queryCellId: query.cell.id });
-        const queryImages = query.content
-          .filter((part) => part.type === "image")
-          .map((part) => ({ type: "image" as const, data: part.data, mimeType: part.mediaType }));
-        const messagesBeforeRound = agent.state.messages.length;
-        hooks.signal?.throwIfAborted();
-        await agent.prompt(queryText(query.content), roundIndex === 0 ? [...contextImages, ...queryImages] : queryImages);
-        lastAssistant = agent.state.messages.findLast(
-          (message): message is Extract<AgentMessage, { role: "assistant" }> => message.role === "assistant",
-        );
-        status = lastAssistant?.stopReason === "aborted"
-          ? "aborted"
-          : lastAssistant?.stopReason === "error"
-            ? "failed"
-            : "completed";
-        const endedAt = new Date().toISOString();
-        rounds.push({
-          index: roundIndex + 1,
-          queryCellId: query.cell.id,
-          final: roundFinal,
-          steps: activitySteps(agent.state.messages.slice(messagesBeforeRound)),
-          startedAt: roundStartedAt,
-          endedAt,
-        });
-        await emit("fx/round_end", { round: roundIndex + 1, queryCellId: query.cell.id, status });
-        if (status !== "completed") break;
-      }
+      // Assemble the whole notebook into a single request: the pending Query
+      // is the only turn that reaches the provider, so one Run is one prompt.
+      const pending = compiled.queries.at(-1);
+      if (!pending) throw new Error(`Agent ${compiled.agent.id} has no Query`);
+      hooks.signal?.throwIfAborted();
+      const roundNumber = rounds.length + 1;
+      const roundStartedAt = new Date().toISOString();
+      roundFinal = "";
+      await emit("fx/round_start", { round: roundNumber, queryCellId: pending.cell.id });
+      const queryImages = pending.content
+        .filter((part) => part.type === "image")
+        .map((part) => ({ type: "image" as const, data: part.data, mimeType: part.mediaType }));
+      const messagesBeforeRound = agent.state.messages.length;
+      hooks.signal?.throwIfAborted();
+      await agent.prompt(queryText(pending.content), [...contextImages, ...queryImages]);
+      lastAssistant = agent.state.messages.findLast(
+        (message): message is Extract<AgentMessage, { role: "assistant" }> => message.role === "assistant",
+      );
+      status = lastAssistant?.stopReason === "aborted"
+        ? "aborted"
+        : lastAssistant?.stopReason === "error"
+          ? "failed"
+          : "completed";
+      const endedAt = new Date().toISOString();
+      rounds.push({
+        index: roundNumber,
+        queryCellId: pending.cell.id,
+        final: roundFinal,
+        steps: activitySteps(agent.state.messages.slice(messagesBeforeRound)),
+        startedAt: roundStartedAt,
+        endedAt,
+      });
+      await emit("fx/round_end", { round: roundNumber, queryCellId: pending.cell.id, status });
       const usage = lastAssistant?.usage ?? hooks.resume?.usage;
       return {
         runId: hooks.resume?.runId ?? randomUUID(),
@@ -241,9 +271,37 @@ export class PiRuntime implements FxRuntime {
     }
   }
 
+  /** Resolve each selected Skill Cell against the extension registry. */
+  private resolveSkills(compiled: CompiledRun): SkillCell[] {
+    const registry = new Map((this.options.skills ?? []).map((skill) => [skill.name, skill]));
+    return compiled.skills.map((cell) => {
+      const extension = registry.get(cell.name);
+      const resolved: SkillCell = { ...cell };
+      if (!resolved.description) resolved.description = extension?.description ?? "";
+      if (!resolved.instructions.trim()) resolved.instructions = extension?.instructions ?? "";
+      return resolved;
+    });
+  }
+
+  /** Resolve each selected Subagent Cell against the extension registry. */
+  private resolveSubagents(compiled: CompiledRun): SubagentCell[] {
+    const registry = new Map((this.options.subagents ?? []).map((agent) => [agent.name, agent]));
+    return compiled.subagents.map((cell) => {
+      const extension = registry.get(cell.name);
+      const resolved: SubagentCell = { ...cell };
+      if (!resolved.description) resolved.description = extension?.description ?? "";
+      if (!resolved.system.trim()) resolved.system = extension?.system ?? "";
+      if (resolved.tools === undefined && extension?.tools) resolved.tools = extension.tools;
+      if (resolved.skills === undefined && extension?.skills) resolved.skills = extension.skills;
+      if (resolved.model === undefined && extension?.model) resolved.model = extension.model;
+      if (resolved.fork === undefined && extension?.fork !== undefined) resolved.fork = extension.fork;
+      return resolved;
+    });
+  }
+
   private subagentTool(
     subagents: Map<string, SubagentCell>,
-    skills: Map<string, CompiledRun["skills"][number]>,
+    skills: Map<string, SkillCell>,
     forkSnapshots: Map<string, AgentMessage[]>,
     emit: (type: string, data: unknown, parentToolCallId?: string) => Promise<void>,
     hooks: RunHooks,
@@ -273,7 +331,7 @@ export class PiRuntime implements FxRuntime {
           }],
           query: [{ type: "text", text: input.task }],
           tools: (definition.tools ?? []).map((name) => ({ id: `tool-${randomUUID()}`, type: "tool", name, description: "" })),
-          skills: (definition.skills ?? []).map((name) => skills.get(name)).filter((skill): skill is CompiledRun["skills"][number] => !!skill),
+          skills: (definition.skills ?? []).map((name) => skills.get(name)).filter((skill): skill is SkillCell => !!skill),
           subagents: [],
         };
         const inheritedMessages = definition.fork ? forkSnapshots.get(toolCallId) ?? [] : [];

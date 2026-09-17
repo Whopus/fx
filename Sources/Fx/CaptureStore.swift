@@ -177,8 +177,10 @@ final class CaptureStore: ObservableObject {
     // Derived presentation data, rebuilt only after a store mutation. Typing in
     // a sheet and moving the column slider must not remap the entire library.
     private var gallerySnapshots: [CaptureSpace: GallerySnapshot] = [:]
-    // Only the synchronous bootstrap shares scans between loading the library
-    // and checking bundled declarations. Later explicit reloads always read disk.
+    // Startup shares one metadata scan between loading the selected library and
+    // the first gallery render. Generated declarations are reconciled against a
+    // fresh disk scan so a failed or stale scan can never append a duplicate
+    // set. Later explicit reloads always read disk.
     private var startupMetadata: [URL: [CaptureRecord]]? = [:]
 
     private let fileManager = FileManager.default
@@ -203,7 +205,7 @@ final class CaptureStore: ObservableObject {
             _ = try? installSodaSystemPromptIfNeeded(sourceURL: sourceURL)
         }
         if shouldInstallBuiltins {
-            _ = try? installBuiltinToolsIfNeeded()
+            try? purgeLegacyBuiltinToolCardsIfNeeded()
         }
         if shouldInstallBuiltins, let sourceURL = justOneAPIContextsSourceURL() {
             _ = try? installJustOneAPIContextsIfNeeded(sourceURL: sourceURL)
@@ -264,9 +266,6 @@ final class CaptureStore: ObservableObject {
         guard collections.contains(where: { $0.id == id }) else { return }
         selectedCollectionID = id
         loadRecords()
-        if automaticallyInstallsBuiltinTools {
-            _ = try? installBuiltinToolsIfNeeded(in: id)
-        }
         persistConfiguration()
     }
 
@@ -330,128 +329,160 @@ final class CaptureStore: ObservableObject {
         return record
     }
 
-    /// Install Fx-owned capability declarations into every managed Library. These records do
-    /// not enable anything by themselves: a tool is registered with the runtime only
-    /// after its Tool item is explicitly added to an Agent notebook.
-    @discardableResult
-    func installBuiltinToolsIfNeeded(in collectionID: UUID? = nil) throws -> [CaptureRecord] {
-        struct Definition {
-            let name: String
-            let description: String
+    /// One generated declaration that must exist exactly once per Library.
+    private struct BuiltinDeclaration {
+        let markerTag: String
+        let title: String
+        let body: String
+        let fileName: String
+        let itemDescription: String
+        let tags: [String]
+        let space: CaptureSpace
+    }
+
+    /// Keep exactly one record for a generated declaration and repair the
+    /// duplicates older builds left behind. The oldest match becomes canonical
+    /// and is refreshed in place; every other match is moved to Trash so a
+    /// Library self-heals the next time it is reconciled. A declaration is only
+    /// created when the Library scan succeeded, because an unreadable folder
+    /// must never be mistaken for an empty one.
+    /// - Returns: the canonical record and whether the Library changed.
+    private func reconcile(
+        _ declaration: BuiltinDeclaration,
+        in library: CollectionFolder,
+        libraryURL: URL,
+        candidates: [CaptureRecord]
+    ) throws -> (record: CaptureRecord, changed: Bool) {
+        let matches = candidates.filter { record in
+            let tags = record.tags ?? []
+            if tags.contains(declaration.markerTag) { return true }
+            // Adopt declarations written before marker tags existed, but never a
+            // user-authored record: it must already carry a builtin tag.
+            return tags.contains("builtin")
+                && record.space == declaration.space
+                && record.title.compare(declaration.title, options: .caseInsensitive) == .orderedSame
+        }.sorted {
+            $0.createdAt == $1.createdAt
+                ? $0.id.uuidString < $1.id.uuidString
+                : $0.createdAt < $1.createdAt
         }
 
-        let definitions = [
-            Definition(
-                name: "read",
-                description: "Read text files and supported images. Use offset and limit to inspect large files in sections."
-            ),
-            Definition(
-                name: "edit",
-                description: "Edit one file using exact, non-overlapping text replacements and return a structured diff."
-            ),
-            Definition(
-                name: "bash",
-                description: "Execute a shell command in the current Collection and return streamed stdout and stderr. Every call includes an intent: one concise sentence describing what the command is meant to accomplish."
-            ),
-            Definition(
-                name: "write",
-                description: "Create or overwrite a file, creating parent directories when needed."
-            ),
-            Definition(
-                name: "search",
-                description: "Call an exact endpoint_id with params from a platform Context. Schema: name!:type=default{enum}; ! is required. code=0 succeeds; data is the payload; next_step paginates. External calls may incur charges."
-            )
-        ]
-        let targetCollections: [CollectionFolder]
-        if let collectionID {
-            targetCollections = collections.filter { $0.id == collectionID }
-        } else {
-            targetCollections = collections
-        }
-        var installed: [CaptureRecord] = []
-
-        for library in targetCollections {
-            let libraryURL = folderURL(for: library)
-            let existingRecords = readMetadata(in: libraryURL)
-            let existingByMarker = existingRecords.reduce(into: [String: CaptureRecord]()) { result, record in
-                for tag in record.tags ?? [] where tag.hasPrefix("builtin:tool:") {
-                    result[tag] = record
-                }
-            }
-
-            for definition in definitions {
-                let markerTag = "builtin:tool:\(definition.name)"
-                let desiredTags = ["tool", "builtin", markerTag]
-                if var existing = existingByMarker[markerTag],
-                   let container = existing.containerFolderName {
-                    let needsUpdate = existing.title != definition.name
-                        || existing.text != definition.description
-                        || existing.itemDescription != definition.description
-                        || existing.tags != desiredTags
-                        || existing.space != .tool
-                    guard needsUpdate else { continue }
-                    let itemURL = libraryURL.appendingPathComponent(container, isDirectory: true)
-                    try definition.description.write(
-                        to: itemURL.appendingPathComponent("tool.md"),
-                        atomically: true,
-                        encoding: .utf8
-                    )
-                    existing.title = definition.name
-                    existing.text = definition.description
-                    existing.fileName = "tool.md"
-                    existing.tags = desiredTags
-                    existing.itemDescription = definition.description
-                    existing.space = .tool
-                    try writeMetadata(existing, to: itemURL)
-                    if selectedCollectionID == library.id,
-                       let index = records.firstIndex(where: { $0.id == existing.id }) {
-                        records[index] = existing
-                    }
-                    installed.append(existing)
-                    continue
-                }
-
-                let id = UUID()
-                let folderName = "\(sanitizedFolderComponent(definition.name))-\(id.uuidString.prefix(8))"
-                let itemURL = libraryURL.appendingPathComponent(folderName, isDirectory: true)
-                try fileManager.createDirectory(at: itemURL, withIntermediateDirectories: false)
-                var completed = false
-                defer { if !completed { try? fileManager.removeItem(at: itemURL) } }
-
-                try definition.description.write(
-                    to: itemURL.appendingPathComponent("tool.md"),
+        if var existing = matches.first, let container = existing.containerFolderName {
+            let duplicates = matches.dropFirst()
+            let itemURL = libraryURL.appendingPathComponent(container, isDirectory: true)
+            let needsUpdate = existing.title != declaration.title
+                || existing.text != declaration.body
+                || existing.fileName != declaration.fileName
+                || existing.itemDescription != declaration.itemDescription
+                || existing.tags != declaration.tags
+                || existing.space != declaration.space
+                || existing.sourceURL != nil
+            if needsUpdate {
+                try declaration.body.write(
+                    to: itemURL.appendingPathComponent(declaration.fileName),
                     atomically: true,
                     encoding: .utf8
                 )
-                let record = CaptureRecord(
-                    id: id,
-                    kind: .text,
-                    title: definition.name,
-                    text: definition.description,
-                    fileName: "tool.md",
-                    sourceURL: nil,
-                    createdAt: Date(),
-                    pixelWidth: nil,
-                    pixelHeight: nil,
-                    thumbnailFileName: nil,
-                    durationSeconds: nil,
-                    isSaved: true,
-                    isTrashed: false,
-                    containerFolderName: folderName,
-                    tags: desiredTags,
-                    itemDescription: definition.description,
-                    space: .tool
+                existing.title = declaration.title
+                existing.text = declaration.body
+                existing.fileName = declaration.fileName
+                existing.itemDescription = declaration.itemDescription
+                existing.tags = declaration.tags
+                existing.space = declaration.space
+                existing.sourceURL = nil
+                try writeMetadata(existing, to: itemURL)
+            }
+            for duplicate in duplicates {
+                guard let duplicateContainer = duplicate.containerFolderName else { continue }
+                var resultingURL: NSURL?
+                try? fileManager.trashItem(
+                    at: libraryURL.appendingPathComponent(duplicateContainer, isDirectory: true),
+                    resultingItemURL: &resultingURL
                 )
-                try writeMetadata(record, to: itemURL)
+            }
+            let changed = needsUpdate || !duplicates.isEmpty
+            if changed {
+                startupMetadata?[libraryURL] = nil
                 if selectedCollectionID == library.id {
-                    records.insert(record, at: 0)
+                    let removedIDs = Set(duplicates.map(\.id))
+                    records.removeAll { removedIDs.contains($0.id) }
+                    if let index = records.firstIndex(where: { $0.id == existing.id }) {
+                        records[index] = existing
+                    }
                 }
-                installed.append(record)
-                completed = true
+            }
+            return (existing, changed)
+        }
+
+        let id = UUID()
+        let folderName = "\(sanitizedFolderComponent(declaration.title))-\(id.uuidString.prefix(8))"
+        let itemURL = libraryURL.appendingPathComponent(folderName, isDirectory: true)
+        try fileManager.createDirectory(at: itemURL, withIntermediateDirectories: false)
+        var completed = false
+        defer { if !completed { try? fileManager.removeItem(at: itemURL) } }
+
+        try declaration.body.write(
+            to: itemURL.appendingPathComponent(declaration.fileName),
+            atomically: true,
+            encoding: .utf8
+        )
+        let record = CaptureRecord(
+            id: id,
+            kind: .text,
+            title: declaration.title,
+            text: declaration.body,
+            fileName: declaration.fileName,
+            sourceURL: nil,
+            createdAt: Date(),
+            pixelWidth: nil,
+            pixelHeight: nil,
+            thumbnailFileName: nil,
+            durationSeconds: nil,
+            isSaved: true,
+            isTrashed: false,
+            containerFolderName: folderName,
+            tags: declaration.tags,
+            itemDescription: declaration.itemDescription,
+            space: declaration.space
+        )
+        try writeMetadata(record, to: itemURL)
+        if selectedCollectionID == library.id {
+            records.insert(record, at: 0)
+        }
+        completed = true
+        return (record, true)
+    }
+
+    /// Early builds materialized the builtin Tool declarations as one capture
+    /// per collection, and an older installer appended a fresh set on every
+    /// launch. Tools now come from the runtime catalog, so remove those legacy
+    /// cards once. Notebooks reference tools by name, not by card id, so
+    /// existing Sessions keep working.
+    func purgeLegacyBuiltinToolCardsIfNeeded() throws {
+        let markerURL = rootURL.appendingPathComponent(".builtin-tool-cards-purged")
+        guard !fileManager.fileExists(atPath: markerURL.path) else { return }
+
+        for library in collections {
+            let libraryURL = folderURL(for: library)
+            guard let existingRecords = scanMetadata(in: libraryURL) else { continue }
+            let legacy = existingRecords.filter { record in
+                (record.tags ?? []).contains { $0.hasPrefix("builtin:tool:") }
+            }
+            for record in legacy {
+                guard let container = record.containerFolderName else { continue }
+                var resultingURL: NSURL?
+                try? fileManager.trashItem(
+                    at: libraryURL.appendingPathComponent(container, isDirectory: true),
+                    resultingItemURL: &resultingURL
+                )
+            }
+            if selectedCollectionID == library.id, !legacy.isEmpty {
+                let removedIDs = Set(legacy.map(\.id))
+                records.removeAll { removedIDs.contains($0.id) }
             }
         }
 
-        return installed
+        try Data().write(to: markerURL, options: [.atomic])
     }
 
     /// Install one concise capability and parameter guide per search platform.
@@ -467,88 +498,32 @@ final class CaptureStore: ObservableObject {
         }) else { return [] }
 
         let libraryURL = folderURL(for: library)
-        let existingRecords = readMetadata(in: libraryURL)
-        let existingByPlatform = existingRecords.reduce(into: [String: CaptureRecord]()) { result, record in
-            guard let platformTag = (record.tags ?? []).first(where: { $0.hasPrefix("platform:") }) else {
-                return
-            }
-            result[String(platformTag.dropFirst("platform:".count))] = record
-        }
+        // A failed scan means "unknown", not "empty": creating declarations
+        // now would append a duplicate set to an existing Library.
+        guard let existingRecords = scanMetadata(in: libraryURL) else { return [] }
         var installed: [CaptureRecord] = []
 
         for definition in definitions {
             let platformID = definition.platformID.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !platformID.isEmpty else { continue }
-            let markerTag = "builtin:context:platform-search:\(platformID)"
-            let desiredTags = ["context", "builtin", "platform:\(platformID)", markerTag]
-            if var existing = existingByPlatform[platformID],
-               let container = existing.containerFolderName {
-                let needsUpdate = existing.title != definition.title
-                    || existing.text != definition.content
-                    || existing.itemDescription != definition.description
-                    || existing.tags != desiredTags
-                    || existing.sourceURL != nil
-                    || existing.space != .context
-                guard needsUpdate else { continue }
-                let itemURL = libraryURL.appendingPathComponent(container, isDirectory: true)
-                try definition.content.write(
-                    to: itemURL.appendingPathComponent("context.md"),
-                    atomically: true,
-                    encoding: .utf8
-                )
-                existing.title = definition.title
-                existing.text = definition.content
-                existing.fileName = "context.md"
-                existing.tags = desiredTags
-                existing.itemDescription = definition.description
-                existing.sourceURL = nil
-                existing.space = .context
-                try writeMetadata(existing, to: itemURL)
-                if selectedCollectionID == library.id,
-                   let index = records.firstIndex(where: { $0.id == existing.id }) {
-                    records[index] = existing
-                }
-                installed.append(existing)
-                continue
-            }
-
-            let id = UUID()
-            let folderName = "\(sanitizedFolderComponent(definition.title))-\(id.uuidString.prefix(8))"
-            let itemURL = libraryURL.appendingPathComponent(folderName, isDirectory: true)
-            try fileManager.createDirectory(at: itemURL, withIntermediateDirectories: false)
-            var completed = false
-            defer { if !completed { try? fileManager.removeItem(at: itemURL) } }
-
-            try definition.content.write(
-                to: itemURL.appendingPathComponent("context.md"),
-                atomically: true,
-                encoding: .utf8
-            )
-            let record = CaptureRecord(
-                id: id,
-                kind: .text,
+            let declaration = BuiltinDeclaration(
+                markerTag: "builtin:context:platform-search:\(platformID)",
                 title: definition.title,
-                text: definition.content,
+                body: definition.content,
                 fileName: "context.md",
-                sourceURL: nil,
-                createdAt: Date(),
-                pixelWidth: nil,
-                pixelHeight: nil,
-                thumbnailFileName: nil,
-                durationSeconds: nil,
-                isSaved: true,
-                isTrashed: false,
-                containerFolderName: folderName,
-                tags: desiredTags,
                 itemDescription: definition.description,
+                tags: ["context", "builtin", "platform:\(platformID)", "builtin:context:platform-search:\(platformID)"],
                 space: .context
             )
-            try writeMetadata(record, to: itemURL)
-            if selectedCollectionID == library.id {
-                records.insert(record, at: 0)
+            let result = try reconcile(
+                declaration,
+                in: library,
+                libraryURL: libraryURL,
+                candidates: existingRecords
+            )
+            if result.changed {
+                installed.append(result.record)
             }
-            installed.append(record)
-            completed = true
         }
         return installed
     }
@@ -574,9 +549,6 @@ final class CaptureStore: ObservableObject {
         selectedCollectionID = collection.id
         persistConfiguration()
         loadRecords()
-        if automaticallyInstallsBuiltinTools {
-            _ = try installBuiltinToolsIfNeeded(in: collection.id)
-        }
         return collection
     }
 
@@ -980,6 +952,7 @@ final class CaptureStore: ObservableObject {
     func prepareRuntime(
         notebook: ContextNotebook,
         workingDirectoryURL: URL,
+        projectDirectoryURL: URL? = nil,
         sessionID: UUID?
     ) -> ContextRuntimePreparation {
         let contextItems = notebook.items.filter { $0.kind == .context }
@@ -998,6 +971,7 @@ final class CaptureStore: ObservableObject {
         }.flatMap { itemFolderURL(for: $0)?.appendingPathComponent("messages.json") }
         return ContextRuntimePreparation(
             notebook: notebook, collectionURL: workingDirectoryURL,
+            projectDirectoryURL: projectDirectoryURL,
             textSources: textSources, mediaURLs: mediaURLs, continuationURL: continuationURL
         )
     }
@@ -1708,12 +1682,22 @@ final class CaptureStore: ObservableObject {
 
     private func readMetadata(in folder: URL) -> [CaptureRecord] {
         if let cached = startupMetadata?[folder] { return cached }
+        let loadedRecords = scanMetadata(in: folder) ?? []
+        startupMetadata?[folder] = loadedRecords
+        return loadedRecords
+    }
+
+    /// Read declarations straight from disk. Returns nil when the directory
+    /// itself cannot be listed, which callers must treat as "unknown" rather
+    /// than "empty": generated declarations are reconciled against this scan,
+    /// and an unreadable library must never be filled with a duplicate set.
+    private func scanMetadata(in folder: URL) -> [CaptureRecord]? {
         guard let children = try? fileManager.contentsOfDirectory(
             at: folder,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else {
-            return []
+            return nil
         }
 
         let decoder = JSONDecoder.fx
@@ -1726,7 +1710,6 @@ final class CaptureStore: ObservableObject {
             record.containerFolderName = child.lastPathComponent
             loadedRecords.append(record)
         }
-        startupMetadata?[folder] = loadedRecords
         return loadedRecords
     }
 

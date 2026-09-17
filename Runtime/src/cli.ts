@@ -4,6 +4,7 @@ import { createWriteStream } from "node:fs";
 import { resolve } from "node:path";
 import { executeAgent, loadNotebook, saveNotebook } from "./notebook.ts";
 import { compactStreamEvent } from "./event-stream.ts";
+import { buildCatalog, loadExtensionRegistry, mergeTools } from "./extensions.ts";
 import { loadModelRegistry, resolveModel } from "./model-registry.ts";
 import { PiRuntime } from "./pi-runtime.ts";
 import { builtinTools } from "./tools.ts";
@@ -15,7 +16,11 @@ function option(name: string): string | undefined {
 }
 
 function usage(): never {
-  console.error("fx-runtime inspect <notebook.json>\nfx-runtime run <notebook.json> --agent <cell-id> [--model provider/model] [--continue] [--event-log path] [--event-stream]");
+  console.error(
+    "fx-runtime inspect <notebook.json>\n" +
+    "fx-runtime catalog [--project-dir <dir>] [--json]\n" +
+    "fx-runtime run <notebook.json> --agent <cell-id> [--model provider/model] [--continue] [--event-log path] [--event-stream]",
+  );
   process.exit(2);
 }
 
@@ -25,6 +30,17 @@ async function writeStreamEvent(event: FxEvent): Promise<void> {
 }
 
 const command = process.argv[2];
+
+// Catalog discovery does not need a notebook: the Swift Tool/Skill/Subagent
+// pickers load it before any Session exists.
+if (command === "catalog") {
+  const projectDir = resolve(option("--project-dir") ?? process.cwd());
+  const registry = await loadExtensionRegistry({ projectDir });
+  const catalog = buildCatalog(projectDir, builtinTools(projectDir), registry);
+  process.stdout.write(`${JSON.stringify(catalog, null, 2)}\n`);
+  process.exit(0);
+}
+
 const file = process.argv[3];
 if (!command || !file) usage();
 const path = resolve(file);
@@ -47,6 +63,16 @@ const modelSpec = option("--model") ?? registry.defaultModel;
 if (!modelSpec?.includes("/")) throw new Error("Set --model provider/model or FX_MODEL");
 const model = resolveModel(registry.models, modelSpec);
 if (!model) throw new Error(`Unknown model: ${modelSpec}`);
+
+// A broken extension file must not abort the run; the missing-name check below
+// still reports a Tool Cell that references a tool the failed file never
+// registered.
+const cwd = process.cwd();
+const projectDir = resolve(option("--project-dir") ?? cwd);
+const extensions = await loadExtensionRegistry({ projectDir, cwd });
+for (const diagnostic of extensions.diagnostics) {
+  process.stderr.write(`extension: ${diagnostic.file}: ${diagnostic.message}\n`);
+}
 
 const controller = new AbortController();
 process.once("SIGINT", () => controller.abort());
@@ -75,7 +101,9 @@ const runtime = new PiRuntime({
     context,
     { ...options, timeoutMs: 60_000 },
   ),
-  tools: builtinTools(),
+  tools: mergeTools(builtinTools(cwd), extensions.tools),
+  skills: extensions.skills,
+  subagents: extensions.subagents,
 });
 const output = await executeAgent(
   notebook,

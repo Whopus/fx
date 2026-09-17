@@ -1,4 +1,10 @@
-import type { AgentHarnessTool, AgentTool, ExecutionEnv } from "@earendil-works/pi-agent-core";
+import type {
+  AgentHarnessTool,
+  AgentTool,
+  AgentToolResult,
+  AgentToolUpdateCallback,
+  ExecutionEnv,
+} from "@earendil-works/pi-agent-core";
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -11,6 +17,13 @@ import {
   NodeExecutionEnv,
 } from "@earendil-works/pi-agent-core/node";
 import { Type } from "typebox";
+import {
+  CodexSearchClient,
+  formatCodexResults,
+  truncateCodexText,
+  type CodexSearchOptions,
+  type CodexSearchResult,
+} from "./search/codex.ts";
 import { adaptTaobaoResult, searchBusinessError } from "./search/taobao.ts";
 
 const JUSTONEAPI_MCP_URL = "https://mcp.justoneapi.com/mcp";
@@ -158,63 +171,140 @@ async function callJustOneAPIEndpoint(
  * Execute one endpoint from the JustOneAPI catalog. Endpoint ids and parameter
  * contracts are supplied by the platform Context items installed in Library.
  */
-export function createJustOneAPISearchTool(
-  options: JustOneAPISearchOptions = {},
-): AgentTool<any> {
+export interface SearchToolOptions extends JustOneAPISearchOptions {
+  codex?: CodexSearchOptions;
+}
+
+interface SearchArguments {
+  endpoint_id?: string;
+  params?: Record<string, unknown>;
+  query?: string;
+  queries?: string[];
+  recency_days?: number;
+  domains?: string[];
+  open?: string[];
+  find?: string;
+}
+
+async function executeJustOneAPISearch(
+  endpointID: string,
+  params: Record<string, unknown>,
+  options: JustOneAPISearchOptions,
+  signal?: AbortSignal,
+): Promise<AgentToolResult<any>> {
+  const token = options.token?.trim() || await loadJustOneAPIToken(options.settingsURL);
+  const value = await callJustOneAPIEndpoint(
+    "call_endpoint",
+    { endpoint_id: endpointID, params },
+    token,
+    options.fetchImpl ?? fetch,
+    signal,
+  );
+
+  const businessError = searchBusinessError(value);
+  if (businessError) throw new Error(`Search failed: ${businessError}`);
+
+  const adapted = adaptTaobaoResult(endpointID, params, value);
+  if (adapted) {
+    return {
+      content: [{ type: "text", text: adapted.text }],
+      details: { operation: "search", endpointID, presentation: adapted.presentation },
+    };
+  }
+  return {
+    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
+    details: { operation: "search", endpointID },
+  };
+}
+
+async function executeWebSearch(
+  params: SearchArguments,
+  client: CodexSearchClient,
+  signal?: AbortSignal,
+  onUpdate?: AgentToolUpdateCallback,
+): Promise<AgentToolResult<any>> {
+  const queries = [...(params.queries ?? [])];
+  if (params.query?.trim()) queries.unshift(params.query.trim());
+  const commands: Record<string, unknown> = {};
+  if (queries.length) {
+    commands.search_query = queries.slice(0, 4).map((query) => {
+      const item: Record<string, unknown> = { q: query };
+      if (params.recency_days) item.recency = params.recency_days;
+      if (params.domains?.length) item.domains = params.domains;
+      return item;
+    });
+  }
+  const open = params.open ?? [];
+  if (params.find && open.length === 1) {
+    commands.find = [{ ref_id: open[0], pattern: params.find }];
+  } else if (open.length) {
+    commands.open = open.map((ref_id) => ({ ref_id }));
+  }
+  if (Object.keys(commands).length === 0) {
+    throw new Error("Provide query/queries, open with ref_ids, or endpoint_id.");
+  }
+
+  onUpdate?.({
+    content: [{ type: "text", text: queries.length ? `Searching: ${queries.join(" | ")}` : "Opening pages…" }],
+    details: {},
+  });
+
+  const startedAt = Date.now();
+  const response = await client.run(commands, signal);
+  const results = (response.results ?? []) as CodexSearchResult[];
+  const sections: string[] = [];
+  if (results.length) sections.push(formatCodexResults(results));
+  else if (response.output) sections.push(response.output.trim());
+  else sections.push("(no results)");
+
+  return {
+    content: [{ type: "text", text: truncateCodexText(sections.join("\n\n")) }],
+    details: { operation: "web-search", queries, opened: open, results, elapsedMs: Date.now() - startedAt },
+  };
+}
+
+/**
+ * Fx's single Search capability. Without `endpoint_id` it searches the live web
+ * through the Codex backend; with `endpoint_id` it calls the exact platform
+ * Context endpoint as before.
+ */
+export function createSearchTool(options: SearchToolOptions = {}): AgentTool<any> {
+  const codex = new CodexSearchClient(options.codex);
   return {
     name: "search",
     label: "Search",
     description: [
-      "Call an exact endpoint_id with params from the selected platform Context; never invent ids or keys.",
-      "Context schema uses name!:type=default{enum}; ! means required and unmarked params are optional.",
-      "Success is code=0, payload is data, and pagination is next_step. External calls may incur charges.",
+      "Search the live web (query/queries, optional recency_days and domains) and return ranked title/url/snippet/ref_id results.",
+      "Use open with ref_ids from a previous result to read pages, and find to filter one opened page.",
+      "With endpoint_id, call one exact platform Context endpoint instead: code=0 succeeds, data is the payload, next_step paginates.",
+      "Never invent endpoint ids or keys. External calls may incur charges.",
     ].join(" "),
     parameters: Type.Object({
-      endpoint_id: Type.String({ description: "Exact endpoint_id documented by the selected platform Context." }),
+      query: Type.Optional(Type.String({ description: "Web search query." })),
+      queries: Type.Optional(Type.Array(Type.String(), { description: "Multiple web search queries in one call (max 4)." })),
+      recency_days: Type.Optional(Type.Integer({ minimum: 1, description: "Only web results from the last N days." })),
+      domains: Type.Optional(Type.Array(Type.String(), { description: "Restrict web results to these domains." })),
+      open: Type.Optional(Type.Array(Type.String(), { description: "ref_ids from a previous search to open and read." })),
+      find: Type.Optional(Type.String({ description: "With a single open ref_id, only return lines matching this pattern." })),
+      endpoint_id: Type.Optional(Type.String({ description: "Exact endpoint_id documented by the selected platform Context." })),
       params: Type.Optional(Type.Record(Type.String(), Type.Unknown(), {
         description: "Endpoint parameters keyed by the snake_case names in the platform Context.",
       })),
     }, { additionalProperties: false }),
-    execute: async (_id, rawParams, signal) => {
+    execute: async (_id, rawParams, signal, onUpdate) => {
       signal?.throwIfAborted();
-      const params = rawParams as {
-        endpoint_id: string;
-        params?: Record<string, unknown>;
-      };
+      const params = rawParams as SearchArguments;
       const endpointID = params.endpoint_id?.trim();
-      if (!endpointID) throw new Error("endpoint_id is required.");
-
-      const token = options.token?.trim() || await loadJustOneAPIToken(options.settingsURL);
-      const value = await callJustOneAPIEndpoint(
-        "call_endpoint",
-        { endpoint_id: endpointID, params: params.params ?? {} },
-        token,
-        options.fetchImpl ?? fetch,
-        signal,
-      );
-
-      const businessError = searchBusinessError(value);
-      if (businessError) throw new Error(`Search failed: ${businessError}`);
-
-      const adapted = adaptTaobaoResult(endpointID, params.params ?? {}, value);
-      if (adapted) {
-        return {
-          content: [{ type: "text", text: adapted.text }],
-          details: {
-            operation: "search",
-            endpointID,
-            presentation: adapted.presentation,
-          },
-        };
+      if (endpointID) {
+        return executeJustOneAPISearch(endpointID, params.params ?? {}, options, signal);
       }
-
-      return {
-        content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
-        details: { operation: "search", endpointID },
-      };
+      return executeWebSearch(params, codex, signal, onUpdate);
     },
   };
 }
+
+/** Backwards-compatible alias for callers that only use the platform Context path. */
+export const createJustOneAPISearchTool = createSearchTool;
 
 /**
  * Host Tool registry. A Tool Cell is a capability selector; it never embeds
@@ -259,20 +349,10 @@ function createIntentBashTool(env: ExecutionEnv): AgentTool<any> {
 export function builtinTools(cwd = process.cwd()): AgentTool<any>[] {
   const env = new NodeExecutionEnv({ cwd });
   return [
-    {
-      name: "echo",
-      label: "Echo",
-      description: "Return the supplied text unchanged.",
-      parameters: Type.Object({ text: Type.String() }),
-      execute: async (_id, params) => ({
-        content: [{ type: "text", text: (params as { text: string }).text }],
-        details: {},
-      }),
-    },
     bindExecutionTool(createReadTool(), env),
     bindExecutionTool(createEditTool(), env),
     createIntentBashTool(env),
     bindExecutionTool(createWriteTool(), env),
-    createJustOneAPISearchTool(),
+    createSearchTool(),
   ];
 }

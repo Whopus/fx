@@ -501,6 +501,7 @@ struct CollectionEditorView: View {
     @State private var navigationTargetID: UUID?
     @State private var navigationLockID: UUID?
     @State private var hoveredItemID: UUID?
+    @State private var hoveredContentItemID: UUID?
     @State private var draggedItemID: UUID?
     @State private var hoveredInsertionIndex: Int?
     @State private var replacementMenuID: UUID?
@@ -511,6 +512,11 @@ struct CollectionEditorView: View {
     @State private var isLoaded = false
     @State private var isRunning = false
     @State private var isLibraryPresented = false
+    @State private var runtimeCatalog: RuntimeCatalog = .empty
+    @State private var catalogKind: ContextCellKind = .tool
+    @State private var isCatalogPresented = false
+    @State private var isCatalogLoading = false
+    @State private var catalogErrorMessage: String?
     @State private var isCloseConfirmationPresented = false
     @State private var primaryAction: ContextPrimaryAction = .run
     @State private var activeSessionID: UUID?
@@ -539,8 +545,18 @@ struct CollectionEditorView: View {
     @State private var compressionTask: Task<Void, Never>?
     @FocusState private var focusedEditorField: ContextEditorFocus?
 
+    /// Directory the Agent, tools, and the Artifacts tree run in. It follows
+    /// the collection's configured working directory (falling back to the
+    /// collection folder), so a Session runs where the user pointed it instead
+    /// of in an isolated per-Session folder.
     private var runtimeWorkingDirectoryURL: URL? {
-        sessionArtifactsURL
+        projectDirectoryURL
+    }
+
+    /// The configured working directory. It is passed to the runtime as both
+    /// its cwd and `--project-dir`, and owns the project `extensions/` folder.
+    private var projectDirectoryURL: URL? {
+        store.selectedCollection.map { store.workingDirectoryURL(for: $0) }
     }
 
     private var availableRecords: [CaptureRecord] {
@@ -550,6 +566,16 @@ struct CollectionEditorView: View {
     private var libraryRecords: [CaptureRecord] {
         guard let space = libraryItemKind.captureSpace else { return [] }
         return availableRecords.filter { ($0.space ?? .context) == space }
+    }
+
+    /// Library records already placed in the notebook, so the picker can grey
+    /// them out instead of letting the same item be inserted twice. The item
+    /// currently being replaced stays selectable so it can be kept.
+    private var addedLibraryRecordIDs: Set<UUID> {
+        Set(notebook.items.compactMap { item in
+            guard item.id != libraryReplacementItemID else { return nil }
+            return item.sourceRecordID
+        })
     }
 
     var body: some View {
@@ -595,7 +621,19 @@ struct CollectionEditorView: View {
                 itemType: libraryItemKind.captureSpace ?? .context,
                 records: libraryRecords,
                 isReplacing: libraryReplacementItemID != nil,
+                addedRecordIDs: addedLibraryRecordIDs,
                 onSelect: addRecords
+            )
+        }
+        .sheet(isPresented: $isCatalogPresented, onDismiss: finishLibrarySelection) {
+            ContextCatalogPicker(
+                kind: catalogKind,
+                catalog: runtimeCatalog,
+                isLoading: isCatalogLoading,
+                errorMessage: catalogErrorMessage,
+                isReplacing: libraryReplacementItemID != nil,
+                projectPath: projectDirectoryURL?.path ?? "",
+                onSelect: addCatalogItems
             )
         }
         .alert("Context Editor", isPresented: Binding(
@@ -646,7 +684,7 @@ struct CollectionEditorView: View {
             ContextSessionArtifactsView(
                 rootURL: runtimeWorkingDirectoryURL,
                 excludedTopLevelPaths: [],
-                excludesManagedItemDirectories: false,
+                excludesManagedItemDirectories: true,
                 refreshRevision: artifactRefreshRevision
             )
             .frame(minHeight: 190, idealHeight: 280, maxHeight: 340)
@@ -792,10 +830,7 @@ struct CollectionEditorView: View {
                 if kind == .query {
                     addItem(.query, at: insertionIndex)
                 } else {
-                    libraryItemKind = kind
-                    libraryInsertionIndex = insertionIndex
-                    libraryReplacementItemID = nil
-                    isLibraryPresented = true
+                    presentPicker(for: kind, insertionIndex: insertionIndex, replacementItemID: nil)
                 }
             }
         }
@@ -804,11 +839,49 @@ struct CollectionEditorView: View {
     private func replaceMenuEntries(itemID: UUID) -> [GlassMenuEntry] {
         ContextCellKind.inputKinds.map { kind in
             GlassMenuEntry(id: kind.rawValue, title: kind.menuLabel, icon: kind.icon) {
-                libraryItemKind = kind
-                libraryInsertionIndex = nil
-                libraryReplacementItemID = itemID
-                isLibraryPresented = true
+                presentPicker(for: kind, insertionIndex: nil, replacementItemID: itemID)
             }
+        }
+    }
+
+    /// Tool, Skill, and Subagent cells reference runtime capabilities, so they
+    /// are picked from the project catalog (builtins + `extensions/*.ts`).
+    /// System and Context still come from saved Library records.
+    private func presentPicker(
+        for kind: ContextCellKind,
+        insertionIndex: Int?,
+        replacementItemID: UUID?
+    ) {
+        if kind == .tool || kind == .skill || kind == .subagent {
+            catalogKind = kind
+            libraryInsertionIndex = insertionIndex
+            libraryReplacementItemID = replacementItemID
+            isCatalogPresented = true
+            loadCatalog()
+        } else {
+            libraryItemKind = kind
+            libraryInsertionIndex = insertionIndex
+            libraryReplacementItemID = replacementItemID
+            isLibraryPresented = true
+        }
+    }
+
+    private func loadCatalog() {
+        guard let projectDirectoryURL else {
+            runtimeCatalog = .empty
+            catalogErrorMessage = "没有可用的工作目录。"
+            return
+        }
+        isCatalogLoading = true
+        catalogErrorMessage = nil
+        Task { @MainActor in
+            do {
+                runtimeCatalog = try await ContextPiRunner.catalog(projectDirectoryURL: projectDirectoryURL)
+            } catch {
+                runtimeCatalog = .empty
+                catalogErrorMessage = error.localizedDescription
+            }
+            isCatalogLoading = false
         }
     }
 
@@ -1344,7 +1417,9 @@ struct CollectionEditorView: View {
         availableRecordsByID: [UUID: CaptureRecord],
         outputRoundsByID: [UUID: [ContextRunRound]]
     ) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let itemID = item.wrappedValue.id
+        let emphasized = hoveredContentItemID == itemID
+        return VStack(alignment: .leading, spacing: 0) {
             Text(item.wrappedValue.kind.menuLabel)
                 .font(.system(size: 14))
                 .foregroundStyle(.secondary.opacity(0.64))
@@ -1352,7 +1427,8 @@ struct CollectionEditorView: View {
             selectedItemEditor(
                 item,
                 availableRecordsByID: availableRecordsByID,
-                outputRoundsByID: outputRoundsByID
+                outputRoundsByID: outputRoundsByID,
+                emphasized: emphasized
             )
 
             Rectangle()
@@ -1361,45 +1437,58 @@ struct CollectionEditorView: View {
                 .padding(.top, item.wrappedValue.kind == .system || item.wrappedValue.kind == .query ? 4 : 12)
         }
         .padding(.bottom, 54)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            if hovering {
+                hoveredContentItemID = itemID
+            } else if hoveredContentItemID == itemID {
+                hoveredContentItemID = nil
+            }
+        }
     }
 
     @ViewBuilder
     private func selectedItemEditor(
         _ item: Binding<ContextNotebookItem>,
         availableRecordsByID: [UUID: CaptureRecord],
-        outputRoundsByID: [UUID: [ContextRunRound]]
+        outputRoundsByID: [UUID: [ContextRunRound]],
+        emphasized: Bool
     ) -> some View {
         let value = item.wrappedValue
         if value.kind == .context,
            let id = value.sourceRecordID,
            let record = availableRecordsByID[id] {
-            referencedRecordEditor(item, record: record)
+            referencedRecordEditor(item, record: record, emphasized: emphasized)
         } else {
             switch value.kind {
             case .query:
                 queryEditor(item)
             case .system, .context:
-                simpleTextEditor(item)
+                simpleTextEditor(item, emphasized: emphasized)
             case .tool:
                 definitionEditor(
                     item,
                     titlePrompt: "Tool name",
                     detailPrompt: "What this tool can do",
-                    bodyPrompt: nil
+                    bodyPrompt: nil,
+                    emphasized: emphasized
                 )
             case .skill:
                 definitionEditor(
                     item,
                     titlePrompt: "Skill name",
                     detailPrompt: "When the agent should use this skill",
-                    bodyPrompt: "Complete skill instructions…"
+                    bodyPrompt: "Complete skill instructions…",
+                    emphasized: emphasized
                 )
             case .subagent:
                 definitionEditor(
                     item,
                     titlePrompt: "Subagent name",
                     detailPrompt: "What this subagent handles",
-                    bodyPrompt: "Subagent system instructions…"
+                    bodyPrompt: "Subagent system instructions…",
+                    emphasized: emphasized
                 )
             case .output:
                 outputEditor(value, visibleRounds: outputRoundsByID[value.id] ?? [])
@@ -1409,7 +1498,7 @@ struct CollectionEditorView: View {
         }
     }
 
-    private func simpleTextEditor(_ item: Binding<ContextNotebookItem>) -> some View {
+    private func simpleTextEditor(_ item: Binding<ContextNotebookItem>, emphasized: Bool) -> some View {
         let itemID = item.wrappedValue.id
         return VStack(alignment: .leading, spacing: 0) {
             TextField(
@@ -1432,7 +1521,8 @@ struct CollectionEditorView: View {
                 prompt: item.wrappedValue.kind == .system
                     ? "System instructions…"
                     : "Paste or write context…",
-                itemID: itemID
+                itemID: itemID,
+                emphasized: emphasized
             )
             .padding(.top, 14)
         }
@@ -1442,7 +1532,8 @@ struct CollectionEditorView: View {
     private func markdownBodyEditor(
         text: Binding<String>,
         prompt: String,
-        itemID: UUID
+        itemID: UUID,
+        emphasized: Bool
     ) -> some View {
         let focus = ContextEditorFocus.body(itemID)
         if focusedEditorField == focus || text.wrappedValue.isEmpty {
@@ -1450,7 +1541,8 @@ struct CollectionEditorView: View {
                 text: text,
                 prompt: prompt,
                 minHeight: 28,
-                focus: focus
+                focus: focus,
+                emphasized: emphasized
             )
         } else {
             let preview = markdownPreview(text.wrappedValue, itemID: itemID)
@@ -1458,7 +1550,7 @@ struct CollectionEditorView: View {
                 ContextMarkdownDocument(
                     markdown: preview.markdown,
                     baseFontSize: 13,
-                    tone: .secondary,
+                    tone: emphasized ? .primary : .secondary,
                     layout: .editorDocument
                 )
                 .equatable()
@@ -1627,7 +1719,8 @@ struct CollectionEditorView: View {
         _ item: Binding<ContextNotebookItem>,
         titlePrompt: String,
         detailPrompt: String,
-        bodyPrompt: String?
+        bodyPrompt: String?,
+        emphasized: Bool
     ) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             TextField(titlePrompt, text: item.title, axis: .vertical)
@@ -1645,7 +1738,7 @@ struct CollectionEditorView: View {
                 .padding(.top, 14)
 
             if let bodyPrompt {
-                cleanTextEditor(text: item.body, prompt: bodyPrompt, minHeight: 28)
+                cleanTextEditor(text: item.body, prompt: bodyPrompt, minHeight: 28, emphasized: emphasized)
                     .padding(.top, 42)
             }
         }
@@ -1656,7 +1749,8 @@ struct CollectionEditorView: View {
         text: Binding<String>,
         prompt: String,
         minHeight: CGFloat,
-        focus: ContextEditorFocus? = nil
+        focus: ContextEditorFocus? = nil,
+        emphasized: Bool = false
     ) -> some View {
         let focusBinding = focus.map { target in
             Binding(
@@ -1675,7 +1769,8 @@ struct CollectionEditorView: View {
             prompt: prompt,
             minHeight: minHeight,
             maximumLines: 50,
-            isFocused: focusBinding
+            isFocused: focusBinding,
+            usesPrimaryTextColor: emphasized
         )
         .frame(minHeight: minHeight, alignment: .top)
     }
@@ -1719,7 +1814,8 @@ struct CollectionEditorView: View {
 
     private func referencedRecordEditor(
         _ item: Binding<ContextNotebookItem>,
-        record: CaptureRecord
+        record: CaptureRecord,
+        emphasized: Bool
     ) -> some View {
         let preview = item.wrappedValue.body.isEmpty
             ? store.context(for: record)
@@ -1735,7 +1831,7 @@ struct CollectionEditorView: View {
                 ContextMarkdownDocument(
                     markdown: visiblePreview.markdown,
                     baseFontSize: 13,
-                    tone: .secondary,
+                    tone: emphasized ? .primary : .secondary,
                     layout: .editorDocument
                 )
                 .equatable()
@@ -1886,7 +1982,7 @@ struct CollectionEditorView: View {
     private func addItem(_ kind: ContextCellKind, at insertionIndex: Int?) {
         let item = ContextNotebookItem(
             kind: kind,
-            title: kind == .query ? "" : kind == .tool ? "echo" : kind.defaultTitle,
+            title: kind == .query ? "" : kind == .tool ? "tool_name" : kind.defaultTitle,
             detail: kind == .tool ? "Return the supplied text unchanged." : ""
         )
         let index = min(max(0, insertionIndex ?? notebook.items.count), notebook.items.count)
@@ -1917,7 +2013,7 @@ struct CollectionEditorView: View {
             title: kind == .query ? "" : record.title,
             body: kind == .context ? store.context(for: record) : store.originalTextContent(for: record) ?? record.text ?? "",
             detail: record.itemDescription ?? "",
-            sourceRecordID: kind == .context ? record.id : nil,
+            sourceRecordID: record.id,
             tools: configuration?.tools,
             skills: configuration?.skills,
             model: configuration?.model,
@@ -1956,6 +2052,30 @@ struct CollectionEditorView: View {
     private func finishLibrarySelection() {
         libraryInsertionIndex = nil
         libraryReplacementItemID = nil
+    }
+
+    private func addCatalogItems(_ items: [ContextNotebookItem]) {
+        guard !items.isEmpty else { return }
+        if let replacementID = libraryReplacementItemID,
+           let index = notebook.items.firstIndex(where: { $0.id == replacementID }),
+           let replacement = items.first {
+            var updated = replacement
+            updated.id = replacementID
+            notebook.items[index] = updated
+            navigationLockID = replacementID
+            selectedItemID = replacementID
+            navigationTargetID = replacementID
+            libraryInsertionIndex = nil
+            libraryReplacementItemID = nil
+            return
+        }
+        let index = min(max(0, libraryInsertionIndex ?? notebook.items.count), notebook.items.count)
+        notebook.items.insert(contentsOf: items, at: index)
+        libraryInsertionIndex = nil
+        guard let firstItem = items.first else { return }
+        navigationLockID = firstItem.id
+        selectedItemID = firstItem.id
+        navigationTargetID = firstItem.id
     }
 
     private func deleteItem(_ id: UUID) {
@@ -2055,6 +2175,7 @@ struct CollectionEditorView: View {
         let preparation = store.prepareRuntime(
             notebook: notebook,
             workingDirectoryURL: runtimeWorkingDirectoryURL,
+            projectDirectoryURL: projectDirectoryURL,
             sessionID: activeSessionID
         )
 
@@ -2262,6 +2383,7 @@ private struct ContextLibraryPicker: View {
     let itemType: CaptureSpace
     let records: [CaptureRecord]
     let isReplacing: Bool
+    let addedRecordIDs: Set<UUID>
     let onSelect: ([CaptureRecord]) -> Void
     @State private var search = ""
     @State private var selectedRecordIDs: Set<UUID> = []
@@ -2319,6 +2441,7 @@ private struct ContextLibraryPicker: View {
                     } else {
                         LazyVStack(spacing: 1) {
                             ForEach(filtered) { record in
+                                let alreadyAdded = addedRecordIDs.contains(record.id)
                                 Button {
                                     if isReplacing {
                                         onSelect([record])
@@ -2359,6 +2482,10 @@ private struct ContextLibraryPicker: View {
                                         if isReplacing {
                                             Image(systemName: "arrow.triangle.2.circlepath")
                                                 .foregroundStyle(.secondary)
+                                        } else if alreadyAdded {
+                                            Image(systemName: "checkmark.circle.fill")
+                                                .font(.system(size: 17, weight: .regular))
+                                                .foregroundStyle(Color.secondary.opacity(0.5))
                                         } else {
                                             Image(systemName: selectedRecordIDs.contains(record.id)
                                                 ? "checkmark.circle.fill"
@@ -2376,8 +2503,11 @@ private struct ContextLibraryPicker: View {
                                         : Color.clear)
                                     .clipShape(RoundedRectangle(cornerRadius: 8))
                                     .contentShape(Rectangle())
+                                    .opacity(alreadyAdded ? 0.4 : 1)
                                 }
                                 .buttonStyle(.plain)
+                                .disabled(alreadyAdded)
+                                .help(alreadyAdded ? "已经添加过了" : "")
                             }
                         }
                     }
@@ -2402,6 +2532,249 @@ private struct ContextLibraryPicker: View {
             return store.fileURL(for: record)
         case .text, .link, .video:
             return nil
+        }
+    }
+}
+
+private enum ContextCatalogEntry: Identifiable {
+    case tool(RuntimeCatalog.Tool)
+    case skill(RuntimeCatalog.Skill)
+    case subagent(RuntimeCatalog.Subagent)
+
+    var id: String {
+        switch self {
+        case .tool(let value): "tool:\(value.name)"
+        case .skill(let value): "skill:\(value.name)"
+        case .subagent(let value): "subagent:\(value.name)"
+        }
+    }
+
+    var name: String {
+        switch self {
+        case .tool(let value): value.name
+        case .skill(let value): value.name
+        case .subagent(let value): value.name
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .tool(let value): value.description
+        case .skill(let value): value.description
+        case .subagent(let value): value.description
+        }
+    }
+
+    var isBuiltin: Bool {
+        if case .tool(let value) = self { return value.builtin ?? false }
+        return false
+    }
+
+    var item: ContextNotebookItem {
+        switch self {
+        case .tool(let value):
+            ContextNotebookItem(kind: .tool, title: value.name, detail: value.description)
+        case .skill(let value):
+            ContextNotebookItem(kind: .skill, title: value.name, detail: value.description)
+        case .subagent(let value):
+            ContextNotebookItem(
+                kind: .subagent,
+                title: value.name,
+                detail: value.description,
+                tools: value.tools,
+                skills: value.skills,
+                model: value.model,
+                fork: value.fork
+            )
+        }
+    }
+}
+
+private struct ContextCatalogPicker: View {
+    @Environment(\.dismiss) private var dismiss
+    let kind: ContextCellKind
+    let catalog: RuntimeCatalog
+    let isLoading: Bool
+    let errorMessage: String?
+    let isReplacing: Bool
+    let projectPath: String
+    let onSelect: ([ContextNotebookItem]) -> Void
+    @State private var search = ""
+    @State private var selectedIDs: Set<String> = []
+
+    private var entries: [ContextCatalogEntry] {
+        let all: [ContextCatalogEntry] = switch kind {
+        case .tool: catalog.tools.map(ContextCatalogEntry.tool)
+        case .skill: catalog.skills.map(ContextCatalogEntry.skill)
+        case .subagent: catalog.subagents.map(ContextCatalogEntry.subagent)
+        default: []
+        }
+        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return all }
+        return all.filter {
+            $0.name.localizedCaseInsensitiveContains(query)
+                || $0.detail.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            if !catalog.diagnostics.isEmpty { diagnosticsBanner }
+            TextField("搜索 \(kind.menuLabel)", text: $search)
+                .textFieldStyle(.roundedBorder)
+                .padding(.horizontal, 22)
+                .padding(.bottom, 14)
+            content
+        }
+        .frame(width: 560, height: 620)
+        .background(Color.white)
+        .onAppear { selectedIDs.removeAll(keepingCapacity: true) }
+    }
+
+    private var header: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("选择 \(kind.menuLabel)").font(.system(size: 20, weight: .semibold))
+                Text(isReplacing
+                    ? "从项目扩展中替换当前 Item。"
+                    : "来源：内置运行时 + extensions/*.ts。")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("取消") { dismiss() }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+            if !isReplacing {
+                Button(selectedIDs.isEmpty ? "添加" : "添加 \(selectedIDs.count) 项") {
+                    onSelect(entries.filter { selectedIDs.contains($0.id) }.map(\.item))
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.black)
+                .disabled(selectedIDs.isEmpty)
+            }
+        }
+        .padding(22)
+    }
+
+    private var diagnosticsBanner: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(catalog.diagnostics) { diagnostic in
+                Text("\((diagnostic.file as NSString).lastPathComponent): \(diagnostic.message)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 22)
+        .padding(.bottom, 10)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if isLoading {
+            ProgressView("加载扩展…")
+                .frame(maxWidth: .infinity, minHeight: 390)
+        } else if let errorMessage {
+            ContentUnavailableView(
+                "无法加载项目扩展",
+                systemImage: "exclamationmark.triangle",
+                description: Text(errorMessage)
+            )
+            .frame(maxWidth: .infinity, minHeight: 390)
+        } else if entries.isEmpty {
+            ContentUnavailableView(
+                "没有可用的 \(kind.menuLabel)",
+                systemImage: kind.icon,
+                description: Text(emptyDescription)
+            )
+            .frame(maxWidth: .infinity, minHeight: 390)
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 1) {
+                    ForEach(entries) { entry in
+                        Button {
+                            select(entry)
+                        } label: {
+                            row(entry)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 8)
+            }
+            .thinScrollIndicator()
+        }
+    }
+
+    private var emptyDescription: String {
+        let location = projectPath.isEmpty ? "extensions/" : "\(projectPath)/extensions/"
+        switch kind {
+        case .tool:
+            return "在 \(location) 放一个 .ts 文件并 export default function (fx) { fx.registerTool(...) }。"
+        case .skill:
+            return "在 \(location) 放一个 .ts 文件并 export default function (fx) { fx.registerSkill(...) }。"
+        case .subagent:
+            return "在 \(location) 放一个 .ts 文件并 export default function (fx) { fx.registerSubagent(...) }。"
+        default:
+            return "在 \(location) 放一个 .ts 扩展文件。"
+        }
+    }
+
+    private func row(_ entry: ContextCatalogEntry) -> some View {
+        HStack(spacing: 13) {
+            Image(systemName: kind.icon)
+                .font(.system(size: 17, weight: .light))
+                .foregroundStyle(.black.opacity(0.66))
+                .frame(width: 52, height: 42)
+                .background(.black.opacity(0.045))
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(entry.name)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.black)
+                        .lineLimit(1)
+                    if entry.isBuiltin {
+                        Text("内置")
+                            .font(.system(size: 9, weight: .semibold))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(.black.opacity(0.07))
+                            .clipShape(Capsule())
+                    }
+                }
+                Text(entry.detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            if isReplacing {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .foregroundStyle(.secondary)
+            } else {
+                Image(systemName: selectedIDs.contains(entry.id) ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 17, weight: .regular))
+                    .foregroundStyle(selectedIDs.contains(entry.id) ? Color.black : Color.secondary.opacity(0.45))
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(height: 62)
+        .background(selectedIDs.contains(entry.id) ? Color.black.opacity(0.045) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(Rectangle())
+    }
+
+    private func select(_ entry: ContextCatalogEntry) {
+        if isReplacing {
+            onSelect([entry.item])
+            dismiss()
+        } else if selectedIDs.contains(entry.id) {
+            selectedIDs.remove(entry.id)
+        } else {
+            selectedIDs.insert(entry.id)
         }
     }
 }

@@ -177,3 +177,35 @@ test("fork copies completed parent messages but excludes the pending delegation 
   const output = await new PiRuntime({ model: faux.getModel(), streamFn: models.streamSimple.bind(models) }).run(compiled);
   assert.equal(output.final, "fork complete");
 });
+
+test("extension registries supply Skill and Subagent bodies when the Cell omits them", async () => {
+  const faux = fauxProvider({ provider: "faux-extension-registry" });
+  const models = createModels();
+  models.setProvider(faux.provider);
+  faux.setResponses([
+    (context) => {
+      assert.deepEqual(context.tools?.map((tool) => tool.name).sort() ?? [], ["load_skill", "subagent"]);
+      assert.match(context.systemPrompt ?? "", /research: Extension research/);
+      assert.match(context.systemPrompt ?? "", /scout: Extension scout/);
+      return fauxAssistantMessage(
+        fauxToolCall("load_skill", { name: "research" }, { id: "extension-skill-call" }),
+        { stopReason: "toolUse" },
+      );
+    },
+    (context) => {
+      assert.match(JSON.stringify(context.messages), /EXTENSION STEPS/);
+      return fauxAssistantMessage("done");
+    },
+  ]);
+  const compiled = base();
+  compiled.skills.push({ id: "skill", type: "skill", name: "research", description: "", instructions: "" });
+  compiled.subagents.push({ id: "subagent", type: "subagent", name: "scout", description: "", system: "" });
+  const output = await new PiRuntime({
+    model: faux.getModel(),
+    streamFn: models.streamSimple.bind(models),
+    skills: [{ name: "research", description: "Extension research", instructions: "EXTENSION STEPS" }],
+    subagents: [{ name: "scout", description: "Extension scout", system: "EXTENSION SYSTEM" }],
+  }).run(compiled);
+  assert.equal(output.status, "completed");
+  assert.equal(output.final, "done");
+});

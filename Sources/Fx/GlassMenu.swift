@@ -5,6 +5,22 @@ import SwiftUI
 
 private let glassMenuLog = Logger(subsystem: "com.fx.desktop", category: "GlassMenu")
 
+/// Tracks whether any `GlassMenu` is currently showing. The menu surface is
+/// hosted above the window's SwiftUI content, so it cannot block SwiftUI's
+/// `onHover` tracking areas by itself. The root view reads this to install a
+/// transparent hover shield over the content while a menu is open.
+@MainActor
+@Observable
+final class GlassMenuPresence {
+    static let shared = GlassMenuPresence()
+    private(set) var openCount = 0
+
+    var isOpen: Bool { openCount > 0 }
+
+    func menuOpened() { openCount += 1 }
+    func menuClosed() { openCount = max(0, openCount - 1) }
+}
+
 /// Values describe rows; actions stay with the view that owns the operation.
 struct GlassMenuEntry: Identifiable {
     enum Kind { case action, separator, heading }
@@ -32,19 +48,88 @@ struct GlassMenuEntry: Identifiable {
 }
 
 enum GlassMenuDensity {
-    case standard, catalog
+    /// Two-line rows with a short description, used for the small context menus.
+    case standard
+    /// Large, single-line rows with a description, used for catalog pickers.
+    case catalog
+    /// Tight single-line rows that mirror a native pop-up menu while keeping
+    /// the app's liquid-glass surface.
+    case compact
 
     func height(of entry: GlassMenuEntry) -> CGFloat {
         switch entry.kind {
-        case .separator: 11
-        case .heading: self == .catalog ? 68 : (entry.detail == nil ? 30 : 48)
-        case .action: self == .catalog ? 52 : (entry.detail == nil ? 36 : 42)
+        case .separator: return self == .compact ? 7 : 11
+        case .heading: return self == .catalog ? 68 : (entry.detail == nil ? 30 : 48)
+        case .action:
+            if self == .catalog { return 52 }
+            if self == .compact { return 30 }
+            return entry.detail == nil ? 36 : 42
         }
     }
 
-    static func material(scheme: ColorScheme, reduceTransparency: Bool) -> Glass {
+    var menuCornerRadius: CGFloat { self == .compact ? 16 : 28 }
+    var rowCornerRadius: CGFloat { self == .compact ? 8 : 16 }
+    var outerPadding: CGFloat { self == .compact ? 6 : 8 }
+    var rowSpacing: CGFloat { self == .compact ? 1 : 2 }
+    var horizontalPadding: CGFloat { self == .compact ? 10 : 14 }
+    var separatorPadding: CGFloat { self == .compact ? 8 : 12 }
+    var shadowRadius: CGFloat { self == .compact ? 10 : 14 }
+    var shadowY: CGFloat { self == .compact ? 6 : 8 }
+    var showsUnselectedCheckmark: Bool { self == .catalog }
+
+    var iconSize: CGFloat {
+        switch self {
+        case .catalog: 18
+        case .standard: 13
+        case .compact: 12
+        }
+    }
+
+    var iconWidth: CGFloat {
+        switch self {
+        case .catalog: 24
+        case .standard: 18
+        case .compact: 16
+        }
+    }
+
+    var iconSpacing: CGFloat {
+        switch self {
+        case .catalog: 12
+        case .standard: 9
+        case .compact: 8
+        }
+    }
+
+    var titleSize: CGFloat {
+        switch self {
+        case .catalog: 15
+        case .standard: 12
+        case .compact: 12.5
+        }
+    }
+
+    var detailSize: CGFloat {
+        switch self {
+        case .catalog: 11.5
+        case .standard: 10
+        case .compact: 10
+        }
+    }
+
+    var detailSpacing: CGFloat { self == .compact ? 2 : 3 }
+    var countSize: CGFloat { self == .compact ? 11 : 12 }
+    var checkSize: CGFloat { self == .compact ? 11 : 12 }
+    var checkWidth: CGFloat { self == .compact ? 12 : 14 }
+    var headingTitleSize: CGFloat { self == .catalog ? 17 : 12 }
+
+    /// The menu surface opts out of `.interactive()` because the system's
+    /// interactive-glass hover highlight tints the row a warm amber. The row's
+    /// own neutral fill below provides the hover feedback instead.
+    static func material(scheme: ColorScheme, reduceTransparency: Bool, interactive: Bool = true) -> Glass {
         if reduceTransparency { return .regular }
-        return scheme == .dark ? .clear.tint(.black.opacity(0.45)).interactive() : .clear.interactive()
+        let glass: Glass = scheme == .dark ? .clear.tint(.black.opacity(0.45)) : .clear
+        return interactive ? glass.interactive() : glass
     }
 }
 
@@ -144,7 +229,7 @@ private struct GlassMenuSurface: View {
             if session.visible {
                 ScrollViewReader { proxy in
                     ScrollView {
-                        VStack(spacing: 2) {
+                        VStack(spacing: session.density.rowSpacing) {
                             ForEach(session.entries) { entry in
                                 row(entry)
                                     .frame(height: session.density.height(of: entry))
@@ -159,16 +244,25 @@ private struct GlassMenuSurface: View {
                         if let id { proxy.scrollTo(id) }
                     }
                 }
-                .padding(8)
+                .padding(session.density.outerPadding)
                 .background {
                     if session.reduceTransparency {
-                        RoundedRectangle(cornerRadius: 28).fill(Color(nsColor: .windowBackgroundColor))
+                        RoundedRectangle(cornerRadius: session.density.menuCornerRadius)
+                            .fill(Color(nsColor: .windowBackgroundColor))
                     }
                 }
                 .glassEffect(GlassMenuDensity.material(scheme: session.scheme,
-                    reduceTransparency: session.reduceTransparency), in: RoundedRectangle(cornerRadius: 28))
+                    reduceTransparency: session.reduceTransparency,
+                    interactive: session.density != .compact),
+                    in: RoundedRectangle(cornerRadius: session.density.menuCornerRadius))
+                .overlay {
+                    RoundedRectangle(cornerRadius: session.density.menuCornerRadius)
+                        .strokeBorder(session.scheme == .dark
+                            ? Color.white.opacity(0.18) : Color.black.opacity(0.12),
+                            lineWidth: 0.5)
+                }
                 .glassEffectID("options", in: glassNamespace)
-                .shadow(color: .black.opacity(0.10), radius: 14, x: 0, y: 8)
+                .shadow(color: .black.opacity(0.10), radius: session.density.shadowRadius, x: 0, y: session.density.shadowY)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -177,47 +271,48 @@ private struct GlassMenuSurface: View {
 
     @ViewBuilder
     private func row(_ entry: GlassMenuEntry) -> some View {
+        let density = session.density
         switch entry.kind {
         case .separator:
-            Divider().padding(.horizontal, 12)
+            Divider().padding(.horizontal, density.separatorPadding)
         case .heading:
             VStack(alignment: .leading, spacing: 5) {
-                Text(entry.title).font(.system(size: session.density == .catalog ? 17 : 12, weight: .semibold))
+                Text(entry.title).font(.system(size: density.headingTitleSize, weight: .semibold))
                 if let detail = entry.detail {
                     Text(detail).font(.system(size: 12)).foregroundStyle(.secondary)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 14)
+            .padding(.horizontal, density.horizontalPadding)
         case .action:
             Button {
                 guard session.visible, entry.enabled else { return }
                 session.choose?(entry)
             } label: {
-                HStack(spacing: session.density == .catalog ? 12 : 9) {
+                HStack(spacing: density.iconSpacing) {
                     if let icon = entry.icon {
                         Image(systemName: icon)
-                            .font(.system(size: session.density == .catalog ? 18 : 13))
+                            .font(.system(size: density.iconSize))
                             .symbolRenderingMode(.monochrome)
-                            .frame(width: session.density == .catalog ? 24 : 18)
+                            .frame(width: density.iconWidth)
                     }
-                    VStack(alignment: .leading, spacing: 3) {
+                    VStack(alignment: .leading, spacing: density.detailSpacing) {
                         Text(entry.title)
-                            .font(.system(size: session.density == .catalog ? 15 : 12, weight: .medium))
+                            .font(.system(size: density.titleSize, weight: .medium))
                             .lineLimit(1)
                         if let detail = entry.detail {
-                            Text(detail).font(.system(size: session.density == .catalog ? 11.5 : 10))
+                            Text(detail).font(.system(size: density.detailSize))
                                 .foregroundStyle(.secondary).lineLimit(1)
                         }
                     }
                     Spacer(minLength: 4)
                     if let count = entry.count {
-                        Text(verbatim: String(count)).font(.system(size: 12, weight: .medium))
+                        Text(verbatim: String(count)).font(.system(size: density.countSize, weight: .medium))
                             .monospacedDigit().foregroundStyle(.secondary)
                     }
-                    if session.density == .catalog || entry.selected {
-                        Image(systemName: "checkmark").font(.system(size: 12, weight: .semibold))
-                            .opacity(entry.selected ? 1 : 0).frame(width: 14)
+                    if density.showsUnselectedCheckmark || entry.selected {
+                        Image(systemName: "checkmark").font(.system(size: density.checkSize, weight: .semibold))
+                            .opacity(entry.selected ? 1 : 0).frame(width: density.checkWidth)
                     }
                     if entry.disclosure {
                         Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold))
@@ -225,12 +320,12 @@ private struct GlassMenuSurface: View {
                     }
                 }
                 .foregroundStyle(entry.destructive ? Color.red : Color.primary)
-                .padding(.horizontal, 14)
+                .padding(.horizontal, density.horizontalPadding)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .contentShape(RoundedRectangle(cornerRadius: 16))
+                .contentShape(RoundedRectangle(cornerRadius: density.rowCornerRadius))
                 .background {
-                    RoundedRectangle(cornerRadius: 16)
-                        .fill(.primary.opacity(session.navigation.highlighted == entry.id ? 0.17 : entry.selected ? 0.055 : 0))
+                    RoundedRectangle(cornerRadius: density.rowCornerRadius)
+                        .fill(rowHighlight(entry))
                 }
                 .opacity(entry.enabled ? 1 : 0.4)
             }
@@ -245,6 +340,18 @@ private struct GlassMenuSurface: View {
             .accessibilityValue(entry.count.map(String.init) ?? "")
             .accessibilityAddTraits(entry.selected ? [.isSelected] : [])
         }
+    }
+
+    /// A neutral, scheme-aware gray so the hover/selection fill never inherits
+    /// the warm tint of the interactive glass or a colorful card behind it.
+    private func rowHighlight(_ entry: GlassMenuEntry) -> Color {
+        if session.navigation.highlighted == entry.id {
+            return session.scheme == .dark ? .white.opacity(0.18) : .black.opacity(0.12)
+        }
+        if entry.selected {
+            return session.scheme == .dark ? .white.opacity(0.10) : .black.opacity(0.06)
+        }
+        return .clear
     }
 }
 
@@ -327,6 +434,7 @@ private struct GlassMenuAnchor: NSViewRepresentable {
         private var refreshScheduled = false
         private var generation = 0
         private var closing = false
+        private var presenceRegistered = false
         private var searchPrefix = ""
         private var lastTypingTime: TimeInterval = 0
 
@@ -393,6 +501,12 @@ private struct GlassMenuAnchor: NSViewRepresentable {
             // Its common parent can, and keeps the menu in the same compositing
             // surface so clear glass retains the live liquid-glass refraction.
             overlayContainer.addSubview(host, positioned: .above, relativeTo: content)
+            // Let the SwiftUI content know it must stop reporting hover while
+            // the menu floats above it.
+            if !presenceRegistered {
+                presenceRegistered = true
+                GlassMenuPresence.shared.menuOpened()
+            }
             position()
             installHandlers(window: window)
             schedulePresentation(of: host)
@@ -533,6 +647,10 @@ private struct GlassMenuAnchor: NSViewRepresentable {
             parentWindow = nil
             previousResponder = nil
             closing = false
+            if presenceRegistered {
+                presenceRegistered = false
+                GlassMenuPresence.shared.menuClosed()
+            }
             if Self.active === self { Self.active = nil }
         }
     }

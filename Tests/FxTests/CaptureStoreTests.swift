@@ -135,34 +135,41 @@ final class CaptureStoreTests: XCTestCase {
     }
 
     @MainActor
-    func testBuiltinToolsInstallOnceIntoEveryLibraryAsInactiveDeclarations() throws {
+    func testLegacyBuiltinToolCardsArePurgedOnceWithoutTouchingUserTools() throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory
-            .appendingPathComponent("FxBuiltinTools-\(UUID().uuidString)", isDirectory: true)
-        let appData = root.appendingPathComponent("AppData", isDirectory: true)
-        let otherCollection = root.appendingPathComponent("Other", isDirectory: true)
+            .appendingPathComponent("FxBuiltinPurge-\(UUID().uuidString)", isDirectory: true)
         defer { try? fileManager.removeItem(at: root) }
-        try fileManager.createDirectory(at: otherCollection, withIntermediateDirectories: true)
 
-        let store = CaptureStore(rootURL: appData)
-        let libraryID = try XCTUnwrap(store.collections.first(where: { $0.name == "Library" })?.id)
-        let other = try store.addCollection(at: otherCollection)
-        XCTAssertEqual(store.selectedCollectionID, other.id)
+        let store = CaptureStore(rootURL: root)
+        let libraryID = try XCTUnwrap(store.selectedCollectionID)
 
-        let installed = try store.installBuiltinToolsIfNeeded()
-        XCTAssertEqual(installed.count, 10)
-        XCTAssertEqual(Set(installed.map(\.title)), Set(["read", "edit", "bash", "write", "search"]))
-        XCTAssertTrue(installed.allSatisfy { $0.space == .tool })
-        XCTAssertEqual(Set(store.records.map(\.title)), Set(["read", "edit", "bash", "write", "search"]))
-        XCTAssertTrue(try store.installBuiltinToolsIfNeeded().isEmpty)
-
+        let legacy = try store.saveAgentItem(space: .tool, title: "read", detail: "Legacy", body: "Legacy")
+        try store.updateDetails(
+            for: legacy.id,
+            title: "read",
+            tags: ["tool", "builtin", "builtin:tool:read"],
+            description: "Legacy"
+        )
+        let userTool = try store.saveAgentItem(space: .tool, title: "my_tool", detail: "User", body: "User")
+        try store.updateDetails(for: userTool.id, title: "my_tool", tags: ["tool"], description: "User")
         store.selectCollection(libraryID)
-        let builtins = store.records.filter { ($0.tags ?? []).contains("builtin") && $0.space == .tool }
-        XCTAssertEqual(Set(builtins.map(\.title)), Set(["read", "edit", "bash", "write", "search"]))
 
-        store.selectCollection(other.id)
-        let otherBuiltins = store.records.filter { ($0.tags ?? []).contains("builtin") && $0.space == .tool }
-        XCTAssertEqual(Set(otherBuiltins.map(\.title)), Set(["read", "edit", "bash", "write", "search"]))
+        try store.purgeLegacyBuiltinToolCardsIfNeeded()
+        XCTAssertNil(store.records.first { $0.id == legacy.id })
+        XCTAssertNotNil(store.records.first { $0.id == userTool.id })
+        XCTAssertTrue(fileManager.fileExists(atPath: root.appendingPathComponent(".builtin-tool-cards-purged").path))
+
+        // The migration marks itself complete; a card created later is kept.
+        let later = try store.saveAgentItem(space: .tool, title: "edit", detail: "Legacy", body: "Legacy")
+        try store.updateDetails(
+            for: later.id,
+            title: "edit",
+            tags: ["tool", "builtin", "builtin:tool:edit"],
+            description: "Legacy"
+        )
+        try store.purgeLegacyBuiltinToolCardsIfNeeded()
+        XCTAssertNotNil(store.records.first { $0.id == later.id })
     }
 
     @MainActor
